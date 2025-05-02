@@ -1,0 +1,8 @@
+[submodule "diffusion_memorization"]
+	path = diffusion_memorization
+	url = https://github.com/pskiers/diffusion_memorization.git
+	branch = main
+[submodule "diffusers"]
+	path = diffusers
+	url = https://github.com/pskiers/diffusers.git
+	branch = lid-project
