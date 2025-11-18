@@ -1,6 +1,9 @@
 # Model cache
 model_cache/
 slurm/
+data/
+new_env/
+na_jutro/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

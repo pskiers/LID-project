@@ -6,3 +6,6 @@
 	path = diffusers
 	url = https://github.com/pskiers/diffusers.git
 	branch = lid-project
+[submodule "universal-diffsae"]
+	path = universal-diffsae
+	url = https://github.com/pskiers/universal-diffsae.git
