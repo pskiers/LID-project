@@ -111,16 +111,25 @@ export SSL_CERT_FILE=/net/home/plgrid/plgpawel269/cacert.pem
 #   --num_samples 10000 \
 #   --max_bs 250
 
-# python -m src.scripts.train \
-#   --dataset_path /net/scratch/hscra/plgrid/plgpawel269/LID-project/diffusion_memorization/outputs/sdxl-monster-a-lot/grads/t50 \
-#   --hookpoints doesnotmatter \
-#   --lr 0.00003 \
-#   --lr_warmup_steps 1000 \
-#   --wandb_project "sae_text_token_grads" \
-#   --expansion_factor 8 \
-#   --k 8 \
-#   --batch_topk true \
-#   --num_epochs 1000 \
-#   --save_every 1000 \
-#   --run_name monster-k8-exp-factor-8 \
-#   --effective_batch_size 512
+python -m src.scripts.train \
+  --dataset_path /home/pskiers/LID-project/diffusion_memorization/outputs/sdxl-toy-a-lot/grads/t50 \
+  --hookpoints doesnotmatter \
+  --lr 0.00003 \
+  --lr_warmup_steps 1000 \
+  --wandb_project "sae_text_token_grads" \
+  --expansion_factor 8 \
+  --k 32 \
+  --batch_topk true \
+  --num_epochs 1000 \
+  --save_every 1000 \
+  --run_name toy-k32-exp-factor-8 \
+  --effective_batch_size 512
+
+
+python compare_subspaces.py \
+    --dirs sae:../universal-diffsae/sae-ckpts/monster-k8-exp-factor-8_grads \
+    --prompt="A picture of a monster" \
+    --token="monster" \
+    --sae_low=-6 \
+    --sae_high=0 \
+    --output_dir=outputs/intreventions/monster_concept_sae_k8_exp_factor8_0-1.5
