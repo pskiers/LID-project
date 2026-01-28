@@ -6,7 +6,10 @@ from PIL import Image
 from typing import Literal
 from tqdm.auto import tqdm
 from pathlib import Path
-from diffusers import StableDiffusionXLPipeline, StableDiffusionPipeline, StableDiffusion3Pipeline, AutoPipelineForText2Image
+from diffusers import StableDiffusionXLPipeline, StableDiffusionPipeline, StableDiffusion3Pipeline, FluxPipeline#, AutoPipelineForText2Image
+import torch
+from diffusers import DiffusionPipeline, UNet2DConditionModel, LCMScheduler
+from huggingface_hub import hf_hub_download
 
 
 def load_prompts(prompts_path: str) -> dict[str, str]:
@@ -25,11 +28,24 @@ def chunk_list(lst, size):
         yield lst[i:i + size]
 
 
+class SDXLDMDPipeline:
+    @staticmethod
+    def from_pretrained(base_model_id,  cache_dir, **kwargs):
+        repo_name = "tianweiy/DMD2"
+        ckpt_name = "dmd2_sdxl_4step_unet_fp16.bin"
+        # Load model.
+        unet = UNet2DConditionModel.from_config(base_model_id, subfolder="unet").to("cuda", torch.float16)
+        unet.load_state_dict(torch.load(hf_hub_download(repo_name, ckpt_name, cache_dir=cache_dir), map_location="cuda"))
+        pipe = DiffusionPipeline.from_pretrained(base_model_id, unet=unet, torch_dtype=torch.float16, variant="fp16", cache_dir=cache_dir).to("cuda")
+        pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
+        return pipe
+
+
 def main(
     prompts_json: str = "prompts.json",
     output_dir: str = "sdxl_samples",
     samples_json: str = "samples.json",
-    model_id: Literal["sdxl", "sd3", "sd1.4", "sdxl_turbo"] = "sdxl",
+    model_id: Literal["sdxl", "sd3", "sd1.4", "sdxl_turbo", "flux", "flux-schnell", "sdxl-dmd"] = "sdxl",
     device: str = "cuda:0",
     n_samples_per_prompt: int = 3,
     batch_size: int = 16,
@@ -47,16 +63,20 @@ def main(
         "sdxl": (StableDiffusionXLPipeline, "stabilityai/stable-diffusion-xl-base-1.0"),
         "sd3": (StableDiffusion3Pipeline, "stabilityai/stable-diffusion-3-medium-diffusers"),
         "sd1.4": (StableDiffusionPipeline, "CompVis/stable-diffusion-v1-4"),
-        "sdxl_turbo": (AutoPipelineForText2Image, "stabilityai/sdxl-turbo"),
+        "sdxl_turbo": (StableDiffusionXLPipeline, "stabilityai/sdxl-turbo"),
+        "sdxl-dmd": (SDXLDMDPipeline, "stabilityai/stable-diffusion-xl-base-1.0"),
+        "flux": (FluxPipeline, "black-forest-labs/FLUX.1-dev"),
+        "flux-schnell": (FluxPipeline, "black-forest-labs/FLUX.1-schnell"),
     }[model_id]
     pipe = ModelCls.from_pretrained(
         hf_path,
-        variant="fp16",
-        torch_dtype=torch.float16,
+        variant="fp16" if model_id not in ["flux", "flux-schnell"] else None,
+        torch_dtype=torch.float16 if model_id not in ["flux", "flux-schnell"] else torch.bfloat16,
         safety_checker=None,
         requires_safety_checker=False,
         cache_dir="./model_cache",
-    ).to(device)
+        device_map="balanced",
+    )
 
     if lora_path is not None:
         print(f"Loading LoRA weights from {lora_path}")
@@ -89,12 +109,21 @@ def main(
                 for idx in range(len(prompts_batch))]
 
         # 5) Generate batch
-        outputs = pipe(
-            prompt=prompts_batch,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_inference_steps,
-            generator=gens,
-        )
+        if model_id == "sdxl-dmd":
+            outputs = pipe(
+                prompt=prompts_batch,
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_inference_steps,
+                generator=gens,
+                timesteps=[999, 749, 499, 249],
+            )
+        else:
+            outputs = pipe(
+                prompt=prompts_batch,
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_inference_steps,
+                generator=gens,
+            )
 
         # 6) Save images and record mapping
         for img, prefix in zip(outputs.images, prefixes_batch):
@@ -146,7 +175,7 @@ if __name__ == "__main__":
     argparser.add_argument("--prompts_json", type=str, default="prompts.json", help="Path to prompts JSON file.")
     argparser.add_argument("--output_dir", type=str, default="sdxl_samples", help="Directory to save generated images.")
     argparser.add_argument("--samples_json", type=str, default="samples.json", help="Filename for samples mapping JSON.")
-    argparser.add_argument("--model_id", type=str, default="sdxl", choices=["sdxl", "sd3", "sd1.4", "sdxl_turbo"], help="Model ID for the diffusion model.")
+    argparser.add_argument("--model_id", type=str, default="sdxl", choices=["sdxl", "sd3", "sd1.4", "sdxl_turbo", "flux", "flux-schnell", "sdxl-dmd"], help="Model ID for the diffusion model.")
     argparser.add_argument("--device", type=str, default="cuda:0", help="Device to run the model on.")
     argparser.add_argument("--n_samples_per_prompt", type=int, default=3, help="Number of samples to generate per prompt.")
     argparser.add_argument("--batch_size", type=int, default=16, help="Batch size for generation.")
