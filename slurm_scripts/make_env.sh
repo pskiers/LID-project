@@ -7,6 +7,8 @@
 #SBATCH --account=plgdynamic2-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:4
+#SBATCH --output=/net/scratch/hscra/plgrid/plgpawel269/LID-project/slurm/stdout/output_%j.out
+#SBATCH --error=/net/scratch/hscra/plgrid/plgpawel269/LID-project/slurm/stderr/error_%j.err
 
 # IMPORTANT: load the modules for machine learning tasks and libraries
 module load ML-bundle/24.06a
@@ -25,3 +27,5 @@ pip install --no-cache torchvision==0.19.0+cu124
 pip install --no-cache -r helios_requirements.txt
 cd diffusers/examples/dreambooth
 pip install --no-cache -r requirements.txt
+pip install --no-cache -r requirements_sdxl.txt
+pip install --no-cache -r requirements_flax.txt
