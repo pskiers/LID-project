@@ -29,3 +29,6 @@ cd diffusers/examples/dreambooth
 pip install --no-cache -r requirements.txt
 pip install --no-cache -r requirements_sdxl.txt
 pip install --no-cache -r requirements_flax.txt
+pip install simple_parsing==0.1.7
+pip install einops==0.8.0
+pip install natsort==8.4.0
