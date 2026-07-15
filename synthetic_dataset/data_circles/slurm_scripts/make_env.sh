@@ -4,11 +4,11 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem-per-cpu=1G
 #SBATCH --time=2880
-#SBATCH --account=plgdynamic2-gpu-gh200
+#SBATCH --account=plgideascvgroup1-gpu-gh200
 #SBATCH --partition=plgrid-gpu-gh200
 #SBATCH --gres=gpu:4
-#SBATCH --output=/net/scratch/hscra/plgrid/plgpawel269/LID-project/slurm/stdout/output_%j.out
-#SBATCH --error=/net/scratch/hscra/plgrid/plgpawel269/LID-project/slurm/stderr/error_%j.err
+#SBATCH --output=/net/scratch/hscra/plgrid/plgekaczmarczyk/LID-project/slurm/stdout/output_%j.out
+#SBATCH --error=/net/scratch/hscra/plgrid/plgekaczmarczyk/LID-project/slurm/stderr/error_%j.err
 
 # IMPORTANT: load the modules for machine learning tasks and libraries
 module load ML-bundle/24.06a

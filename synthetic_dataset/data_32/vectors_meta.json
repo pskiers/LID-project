@@ -1,0 +1,25 @@
+{
+  "shape": [
+    50000,
+    9
+  ],
+  "dtype": "float32",
+  "columns": [
+    "is_triangle",
+    "is_square",
+    "is_circle",
+    "r",
+    "g",
+    "b",
+    "size",
+    "v_stripe",
+    "grain"
+  ],
+  "notes": {
+    "is_triangle / is_square / is_circle": "one-hot shape encoding",
+    "r / g / b": "linear [0,1]; floor 80/255, ceiling 630/765",
+    "size": "linear [0,1]; half-size maps to 5\u201313px",
+    "v_stripe": "vertical stripe darkness [0,1]; 0=invisible, 1=black; width fixed at 3px",
+    "grain": "pixel noise \u00b140 per channel"
+  }
+}

@@ -1,10 +1,18 @@
-# Model cache
+env/
+data/
+outputs/
+slurm/
+*.png
+*.jpg
+*.pem# Model cache
 model_cache/
 slurm/
 data/
 new_env/
 na_jutro/
 models/
+synthetic_dataset/**/images_cached.npy
+synthetic_dataset/wandb/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

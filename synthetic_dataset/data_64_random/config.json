@@ -1,0 +1,13 @@
+{
+  "output_dir": "data_64_random",
+  "n_samples": 100000,
+  "resolution": [
+    64,
+    64
+  ],
+  "seed": 42,
+  "image_format": "PNG",
+  "num_workers": 0,
+  "verbose": true,
+  "perturb": true
+}

@@ -1,0 +1,21 @@
+{
+  "output_dir": "data_circles",
+  "n_samples": 10000,
+  "resolution": [
+    64,
+    64
+  ],
+  "seed": 42,
+  "image_format": "PNG",
+  "num_workers": 0,
+  "verbose": true,
+  "perturb": true,
+  "fix_shape": 2,
+  "fix_r": null,
+  "fix_g": null,
+  "fix_b": null,
+  "fix_size": null,
+  "fix_h_stripe": null,
+  "fix_v_stripe": null,
+  "fix_grain": null
+}
