@@ -28,14 +28,14 @@ from models.conditioner import ShapeConditioningEncoder
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default="outputs/checkpoints/outputs_64_acc_random/checkpoint-epoch-0200")
+    parser.add_argument("--checkpoint", type=str, default="outputs/checkpoints/outputs_64_acc_update1/checkpoint-epoch-0200")
     parser.add_argument("--num_steps",  type=int, default=10)
     parser.add_argument("--n",          type=int, default=5000,
                         help="Number of images to generate")
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--out_dir",    type=str, default="outputs/samples_for_grads/circle_red_big")
+    parser.add_argument("--out_dir",    type=str, default="outputs/samples_for_grads/circle_no_text_update1")
     parser.add_argument("--prompt",     type=float, nargs=10,
-                        default=[0.0, 0.0, 1.0,  0.5, 0.5, 0.5,  0.5,  0.5, 0.5, 0.5],
+                        default=[0.0, 0.0, 1.0,  0.5, 0.5, 0.5,  0.5,  0, 0, 0],
                         metavar=("is_tri", "is_sq", "is_circ", "r", "g", "b", "size",
                                  "h_stripe", "v_stripe", "grain"),
                         help="10 conditioning values: [is_triangle, is_square, is_circle, "

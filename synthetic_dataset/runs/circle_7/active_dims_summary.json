@@ -1,0 +1,25 @@
+{
+  "n_samples": 70000,
+  "kappa": 64,
+  "per_sample_mean": 7.547514285714286,
+  "per_sample_median": 7.0,
+  "per_sample_std": 1.4284155432091996,
+  "per_sample_min": 3,
+  "per_sample_max": 13,
+  "group_averaged_active_dims": 13,
+  "group_averaged_dim_indices": [
+    12,
+    13,
+    16,
+    19,
+    23,
+    27,
+    31,
+    38,
+    43,
+    45,
+    49,
+    59,
+    60
+  ]
+}

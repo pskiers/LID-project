@@ -16,8 +16,18 @@ Different timesteps capture different levels of abstraction:
   - mid  t (e.g. 500): mid-level features
   - low  t (e.g. 300): fine details, texture
 
+Conditioning dimensionality is FLEXIBLE via --cond_input_dim (default 10,
+matching the original shape+rgb+size+stripe+grain dataset). Set it to 7 for
+the no-texture variant (shape+rgb+size, stripe/grain columns dropped
+entirely from SampleVector64), or any other value that follows the same
+feature ordering convention:
+    [is_tri, is_sq, is_circ,  r, g, b, size,  h_stripe, v_stripe, grain]
+                                                (first N of these, N=cond_input_dim)
+--prompt takes exactly --cond_input_dim values; if omitted, a sensible
+default is built automatically for whichever --cond_input_dim you pass.
+
 Usage:
-    # single timestep
+    # single timestep, default 10-dim conditioning
     python collect_gradients.py 
         --checkpoint /net/scratch/hscra/plgrid/plgekaczmarczyk/LID-project/synthetic_dataset/outputs/checkpoints/outputs_64_acc/checkpoint-epoch-0200 \\
         --data_dir /net/scratch/hscra/plgrid/plgekaczmarczyk/LID-project/synthetic_dataset/outputs/samples/samples_64_random_acc \\
@@ -26,9 +36,14 @@ Usage:
     # multiple timesteps
     python collect_gradients.py --checkpoint outputs_64/checkpoint-epoch-0200 \\
         --data_dir outputs/samples/samples_64_random --timesteps 100 300 500 700
+
+    # 7-dim no-texture variant (shape+rgb+size, stripe/grain columns dropped)
+    python collect_gradients.py --checkpoint outputs_64_notexture/checkpoint-epoch-0200 \\
+        --data_dir outputs/samples/samples_64_notexture --cond_input_dim 7
 """
 
 import argparse
+import inspect
 import random
 import time
 from pathlib import Path
@@ -45,31 +60,92 @@ from models.conditioner import ShapeConditioningEncoder
 from dataset_64 import SampleVector64, ImageGenerator64
 
 
+# Canonical feature ordering. --cond_input_dim N takes the first N of these —
+# so 10 is the full original set, 7 is shape+rgb+size with stripe/grain
+# columns dropped entirely (matching how SampleVector64 was slimmed down for
+# the no-texture variant), and any other N follows the same prefix rule if
+# your dataset variant matches this ordering convention.
+FEATURE_NAMES_FULL = ["is_tri", "is_sq", "is_circ", "r", "g", "b", "size",
+                       "h_stripe", "v_stripe", "grain"]
+N_SHAPE_DIMS = 3   # is_tri, is_sq, is_circ — always the first 3, one-hot
+
+# Default value for each continuous feature, used only when --prompt is
+# omitted and a default conditioning vector needs to be built for whichever
+# --cond_input_dim is in effect.
+CONTINUOUS_DEFAULTS = {
+    "r": 1.0, "g": 1.0, "b": 1.0, "size": 1.0,
+    "h_stripe": 0.5, "v_stripe": 0.5, "grain": 0.5,
+}
+
+
+def feature_names_for(cond_input_dim: int) -> list:
+    if cond_input_dim < N_SHAPE_DIMS or cond_input_dim > len(FEATURE_NAMES_FULL):
+        raise ValueError(
+            f"--cond_input_dim={cond_input_dim} is outside the supported range "
+            f"[{N_SHAPE_DIMS}, {len(FEATURE_NAMES_FULL)}] for this script's feature "
+            f"ordering convention. If your dataset uses a different feature layout "
+            f"entirely (not a prefix of {FEATURE_NAMES_FULL}), FEATURE_NAMES_FULL "
+            f"above needs to be edited to match, not just this dimension count."
+        )
+    return FEATURE_NAMES_FULL[:cond_input_dim]
+
+
+def default_prompt_for(cond_input_dim: int) -> list:
+    """Shape defaults to circle ([0,0,1]) truncated/padded to however many
+    shape dims are in play (always 3 here); continuous features default per
+    CONTINUOUS_DEFAULTS. Matches the original script's default exactly when
+    cond_input_dim=10."""
+    names = feature_names_for(cond_input_dim)
+    shape_default = [0.0, 0.0, 1.0][:N_SHAPE_DIMS]
+    vec = list(shape_default)
+    for name in names[N_SHAPE_DIMS:]:
+        vec.append(CONTINUOUS_DEFAULTS[name])
+    return vec
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default="outputs/checkpoints/outputs_64_acc_random/checkpoint-epoch-0200")
-    parser.add_argument("--data_dir",   type=str, default="outputs/samples_for_grads/circle",
+    parser.add_argument("--checkpoint", type=str, default="outputs/checkpoints/outputs_64_acc_update1/checkpoint-epoch-0200")
+    parser.add_argument("--data_dir",   type=str, default="outputs/samples_for_grads/circle_only_text_update1",
                         help="Folder with 000000.png ... and vectors.npy")
-    parser.add_argument("--out_dir",    type=str, default="outputs/gradients/t_mult_big_5k")
+    parser.add_argument("--out_dir",    type=str, default="outputs/gradients/t_mult_only_text_5k_update1")
     parser.add_argument("--num_steps",  type=int, default=10,
                         help="DDIM steps for denoising")
     parser.add_argument("--n_pairs",    type=int, default=5000,
                         help="Number of pairs to compute gradients for")
-    parser.add_argument("--timesteps",  type=int, nargs="+", default=[999,900,800,700,600,500,400,300,200,100],
+    parser.add_argument("--timesteps",  type=int, nargs="+", default=[999,900,800,700,600,500, 50],
                         help="Noise timestep(s) to run, e.g. --timesteps 500 or --timesteps 100 300 500 700")
-    parser.add_argument("--prompt",     type=float, nargs=10,
-                        default=[0.0, 0.0, 1.0,  0.5, 0.5, 0.5,  0.5,  0.5, 0.5, 0.5],
-                        metavar=("is_tri", "is_sq", "is_circ", "r", "g", "b", "size",
-                                 "h_stripe", "v_stripe", "grain"),
-                        help="Conditioning vector for anchor image (default: circle, all others 0.5)")
+    parser.add_argument("--cond_input_dim", type=int, default=10,
+                        help="Conditioner input dimensionality. Default 10 matches the "
+                             "original shape+rgb+size+stripe+grain dataset. Set to 7 for "
+                             "the no-texture variant (shape+rgb+size, stripe/grain columns "
+                             "dropped entirely). Determines both --prompt's expected length "
+                             "and which SampleVector64 kwargs get passed in --average_anchor mode.")
+    parser.add_argument("--prompt",     type=float, nargs="+", default=None,
+                        help="Conditioning vector for anchor image. Length must equal "
+                             "--cond_input_dim. If omitted, a sensible default is built "
+                             "automatically (circle shape, full-value color/size, neutral "
+                             "0.5 for any stripe/grain dims present). Feature order: "
+                             + ", ".join(FEATURE_NAMES_FULL) + " (first --cond_input_dim of these).")
     parser.add_argument("--average_anchor", action="store_true", default=True,
                         help="If set, anchor image is a deterministically rendered average image "
                              "(all continuous features set to 0.5, shape taken from --prompt)")
-    parser.add_argument("--multiple_anchors", action="store_true", default=False,
+    parser.add_argument("--multiple_anchors", action="store_true", default=True,
                         help="If set, compute gradients between random pairs — no fixed anchor. "
                              "Overrides --average_anchor.")
     parser.add_argument("--seed",       type=int, default=42)
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    feature_names = feature_names_for(args.cond_input_dim)
+    if args.prompt is None:
+        args.prompt = default_prompt_for(args.cond_input_dim)
+    elif len(args.prompt) != args.cond_input_dim:
+        raise SystemExit(
+            f"--prompt has {len(args.prompt)} values but --cond_input_dim={args.cond_input_dim} "
+            f"expects {args.cond_input_dim}. Feature order: {feature_names}"
+        )
+    args._feature_names = feature_names   # stashed for logging below
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -109,20 +185,59 @@ def denoise_with_grad(unet, cond_out, noisy_image, ddim):
     return image
 
 
+def build_average_anchor_vector(prompt, feature_names):
+    """Builds the deterministic average-render SampleVector64 for whichever
+    continuous features are actually present, given --cond_input_dim.
+
+    Only passes kwargs that SampleVector64.__init__ actually accepts —
+    inspected at runtime rather than hardcoded, so this works whether your
+    slimmed-down (e.g. 7-dim) SampleVector64 dropped stripe/grain fields
+    entirely, or kept them with fixed neutral defaults. Any continuous
+    feature both present in `feature_names` and accepted by SampleVector64
+    gets set to 0.5 by default, then overridden from `prompt` if the prompt
+    explicitly fixed it away from 0.5.
+    """
+    valid_params = set(inspect.signature(SampleVector64.__init__).parameters) - {"self"}
+    continuous_names = feature_names[N_SHAPE_DIMS:]
+
+    kwargs = {"shape_id": int(np.argmax(prompt[:N_SHAPE_DIMS]))}
+    for name in continuous_names:
+        if name in valid_params:
+            kwargs[name] = 0.5
+        # else: this SampleVector64 variant doesn't have this field at all
+        # (e.g. stripe/grain dropped for the no-texture dataset) — skip it
+        # silently rather than passing an unexpected kwarg.
+
+    avg_vec = SampleVector64(**kwargs)
+
+    # override only features that are not at their default (0.5) in the prompt
+    # i.e. keep any explicitly fixed continuous values from prompt
+    for feat_idx, name in enumerate(continuous_names, start=N_SHAPE_DIMS):
+        if name not in valid_params:
+            continue
+        val = prompt[feat_idx]
+        if val != 0.5:
+            setattr(avg_vec, name, val)
+
+    return avg_vec
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
     args    = parse_args()
-    cfg     = Config()
+    cfg     = Config(cond_input_dim=args.cond_input_dim)
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt    = Path(args.checkpoint)
 
+    print(f"Conditioning dim: {args.cond_input_dim}  |  feature order: {args._feature_names}")
+
     # save run config
-    config_txt = "\n".join(f"{k}: {v}" for k, v in vars(args).items())
+    config_txt = "\n".join(f"{k}: {v}" for k, v in vars(args).items() if not k.startswith("_"))
     (out_dir / "run_config.txt").write_text(config_txt)
     print(f"Saved run config → {out_dir / 'run_config.txt'}")
 
@@ -163,7 +278,7 @@ def main():
 
     # anchor conditioning vector from --prompt argument
     vec_a = torch.tensor(args.prompt, dtype=torch.float32)
-    print(f"Anchor prompt: {args.prompt}")
+    print(f"Anchor prompt ({args.cond_input_dim}-dim): {args.prompt}")
 
     if args.multiple_anchors:
         # random pairs — different image_A each time, vec_a taken from dataset not used
@@ -171,24 +286,7 @@ def main():
         pairs = [tuple(rng.sample(range(len(dataset)), 2)) for _ in range(args.n_pairs)]
         img_a = None   # will be set per pair
     elif args.average_anchor:
-        # build average vector: shape from prompt, all continuous features = 0.5
-        prompt = args.prompt
-        avg_vec = SampleVector64(
-            shape_id = int(np.argmax(prompt[:3])),
-            r        = 0.5,
-            g        = 0.5,
-            b        = 0.5,
-            size     = 0.5,
-            h_stripe = 0.5,
-            v_stripe = 0.5,
-            grain    = 0.5,
-        )
-        # override only features that are not at their default (0.5) in the prompt
-        # i.e. keep any explicitly fixed continuous values from prompt
-        for feat_idx, attr in enumerate(["r", "g", "b", "size", "h_stripe", "v_stripe", "grain"], start=3):
-            val = prompt[feat_idx]
-            if val != 0.5:
-                setattr(avg_vec, attr, val)
+        avg_vec = build_average_anchor_vector(args.prompt, args._feature_names)
 
         pil_img = ImageGenerator64().generate(avg_vec, seed=0)
         img_t   = torch.from_numpy(
@@ -262,7 +360,7 @@ def main():
                 print(f"  First pair: {elapsed:.1f}s | this timestep ETA: {eta_min:.1f} min | "
                       f"overall ETA: ~{job_eta_min:.1f} min")
 
-        grads_matrix = np.stack(all_grads, axis=0)   # (N, 64)
+        grads_matrix = np.stack(all_grads, axis=0)   # (N, cond_output_dim)
         grads_path   = out_dir / f"grads_t{noise_t}.npy"
         np.save(grads_path, grads_matrix)
         print(f"  Saved {grads_matrix.shape} → {grads_path}")

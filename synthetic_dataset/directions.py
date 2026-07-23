@@ -38,22 +38,23 @@ from models.conditioner import ShapeConditioningEncoder
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint",         type=str, default="outputs/checkpoints/outputs_64_acc_random/checkpoint-epoch-0200")
-    parser.add_argument("--grads",              type=str, nargs="+", default=["outputs/gradients/t_mult/grads_t500.npy"],
-                        help="One or more grads_tXXX.npy files")
-    parser.add_argument("--out_dir",            type=str, default="outputs/circle_rb_mult_5k_norm")
+    parser.add_argument("--checkpoint",         type=str, default="outputs/checkpoints/outputs_64_acc_update1/checkpoint-epoch-0200")
+    parser.add_argument("--grads",              type=str, nargs="+", default=["outputs/gradients/t_mult_only_text_5k_update1"],
+                        help="One or more grads_tXXX.npy files, or a single directory "
+                             "containing them (all grads_t*.npy files will be used, sorted by timestep)")
+    parser.add_argument("--out_dir",            type=str, default="outputs/interventions/t_mult_only_text_5k_update1")
     parser.add_argument("--num_steps",          type=int, default=10)
     parser.add_argument("--n_directions",       type=int, default=64,
                         help="Number of top PCA directions to visualize")
     parser.add_argument("--num_interventions",  type=int, default=10,
                         help="How many directions to visualize per dataset")
     parser.add_argument("--intervention_strengths", type=float, nargs="+",
-                        default=[ 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0,  -0.1, -0.2, -0.3, -0.4, -0.5 , -0.6],
+                        default=[ 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0, -0.1, -0.2, -0.3, -0.4, -0.5 , -0.6],
                         help="Strengths to apply each direction at")
     parser.add_argument("--imgs_per_strength",  type=int, default=4,
                         help="Images per intervention strength (columns)")
     parser.add_argument("--base_prompt",   type=float, nargs=10,
-                        default=[0.0, 0.0, 1.0,  1, 0.5, 0.5,  1,  0.5, 0.5, 0.5],
+                        default=[0.0, 0.0, 1.0,  0.5, 0.5, 0.5,  0.5,  0.5, 0.5, 0.5],
                         metavar=("is_tri", "is_sq", "is_circ", "r", "g", "b", "size",
                                  "h_stripe", "v_stripe", "grain"),
                         help="Base conditioning vector for intervention images. "
@@ -183,7 +184,19 @@ def make_intervention_grid(images_2d, strengths, direction_idx, variance, scale=
 
 def main():
     args    = parse_args()
-    cfg     = Config()
+
+    # expand directory to sorted list of grads_t*.npy files
+    if len(args.grads) == 1 and Path(args.grads[0]).is_dir():
+        grads_dir = Path(args.grads[0])
+        found = sorted(grads_dir.glob("grads_t*.npy"),
+                       key=lambda p: int(''.join(filter(str.isdigit, p.stem))))
+        if not found:
+            raise FileNotFoundError(f"No grads_t*.npy files found in {grads_dir}")
+        args.grads = [str(p) for p in found]
+        print(f"Expanded directory {grads_dir} → {len(args.grads)} files:")
+        for p in args.grads:
+            print(f"  {p}")
+    cfg     = Config(cond_input_dim=10)
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

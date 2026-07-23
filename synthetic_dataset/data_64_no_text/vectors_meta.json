@@ -1,0 +1,41 @@
+{
+  "shape": [
+    100000,
+    7
+  ],
+  "dtype": "float32",
+  "columns": [
+    "is_triangle",
+    "is_square",
+    "is_circle",
+    "r",
+    "g",
+    "b",
+    "size"
+  ],
+  "features": [
+    "shape",
+    "color",
+    "size"
+  ],
+  "disabled_features": [
+    "stripes",
+    "grain"
+  ],
+  "full_schema": [
+    "is_triangle",
+    "is_square",
+    "is_circle",
+    "r",
+    "g",
+    "b",
+    "size",
+    "h_stripe",
+    "v_stripe",
+    "grain"
+  ],
+  "perturbation": {
+    "dead_zone": 0.1,
+    "description": "No perturbation for v <= 0.1 or v >= 0.9. Linear interpolation to max width at v=0.5. Set dead_zone=0.0 for original behaviour. Disabled feature groups are never perturbed (held exactly constant)."
+  }
+}

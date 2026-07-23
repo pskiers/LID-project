@@ -44,7 +44,7 @@ from diffusers.training_utils import EMAModel
 from configs.config_64 import Config64 as Config
 from models.conditioner import ShapeConditioningEncoder
 from models import build_unet
-from dataset_64 import ShapeDataset64
+from dataset_64_update import ShapeDataset64
 
 
 logger = get_logger(__name__, log_level="INFO")
