@@ -43,8 +43,45 @@ before). You can also use --fix_* on an *excluded* group to override its
 default neutral constant (e.g. force grain=0.2 as unmodeled nuisance
 texture while still excluding it from the label vector).
 
+Per-shape feature dimensionality (--triangle_features / --square_features /
+--circle_features)
+--------------------------------------------------------------------------
+By default every shape uses the same --features set (10-dim/all groups).
+You can instead give EACH shape its own feature-group subset, e.g.:
+
+    python dataset_64.py --circle_features shape,color,size,stripes,grain \\
+                         --triangle_features shape,color,size \\
+                         --square_features shape,color
+
+This gives circles the full 10-dim factor set, triangles 7 real dims
+(no texture), and squares 4 real dims (color only, fixed size/no texture).
+
+Unlike the global --features mechanism (which SHRINKS the stored vector
+to only the active columns), per-shape mode keeps every stored vector at
+the FULL 10 dimensions, always -- a feature that's inactive for a given
+shape is set to exactly 0.0 in that sample's vector (not the neutral
+0.5-style default used elsewhere), rather than being dropped from the
+vector entirely. This is deliberate: it's what lets every image in the
+dataset share the same conditioning vector dimensionality regardless of
+which shape (and therefore which feature subset) it was generated from,
+while a 0 unambiguously marks "this factor doesn't apply to this sample"
+rather than looking like a legitimate low value of an active feature.
+Rendering also uses 0.0 for any inactive-for-this-shape feature (e.g. an
+inactive size renders at the smallest allowed size; an inactive color
+renders as the existing degenerate-color gray fallback), so what's
+labeled and what's rendered never disagree.
+
+Per-shape mode activates automatically the moment you pass ANY of
+--triangle_features / --square_features / --circle_features; leave all
+three unset and the dataset behaves exactly as before (global --features,
+shrinking vector). A shape you don't override still defaults to the full
+10-dim/--features set, per "10 dims per feature is the default". "shape"
+itself is always force-included in every per-shape override, since every
+image has exactly one rendered shape no matter what else is active.
+
 Perturbation (stochastic rendering) — unchanged from before, and only
-applied to *active* (included) continuous features:
+applied to *active* (included, for that sample's shape) continuous
+features:
   Original:  width = 1 - 2|v - 0.5|
              zero only exactly at v=0 and v=1
 
@@ -66,10 +103,15 @@ Usage
   python dataset_64.py --output_dir data_64 --features shape,color,size     # no textures, 7-dim
   python dataset_64.py --output_dir data_64 --features color,size          # fixed shape, 4-dim
   python dataset_64.py --output_dir data_64 --features shape               # fixed color/size/texture, 3-dim
-  python dataset_64.py --output_dir data_64 --dead_zone 0.0   # original perturbation behaviour
+  python dataset_64_update.py --output_dir data/data_64_dz0.4 --dead_zone 0.4 --n_samples 100000
   python dataset_64.py --output_dir data_64 --no_perturb
   python dataset_64.py --output_dir data_64 --no_cache                     # skip auto-caching
   python dataset_64.py --output_dir data_64 --cache                        # (re)build cache only, no generation
+
+  # per-shape dimensionality, full 10-dim stored vectors throughout:
+  python dataset_64.py --output_dir data_64_mixed \\
+      --triangle_features shape,color,size \\
+      --square_features shape,color
 """
 
 from __future__ import annotations
@@ -121,13 +163,27 @@ FEATURE_GROUPS = {
 }
 
 # Neutral constants used when a feature group is excluded and no --fix_*
-# override was supplied for its constituent attribute(s).
+# override was supplied for its constituent attribute(s). Only used in the
+# original GLOBAL --features mode; per-shape mode always zeros instead
+# (see ZERO_DEFAULTS / _apply_group_defaults).
 GROUP_DEFAULTS = {
     "shape":   {"shape_id": 2},              # default to circle
     "color":   {"r": 0.5, "g": 0.5, "b": 0.5},  # neutral mid-gray
     "size":    {"size": 0.5},                # mid size
     "stripes": {"h_stripe": 0.0, "v_stripe": 0.0},  # no stripes
     "grain":   {"grain": 0.0},               # no grain
+}
+
+# Per-shape mode's defaults for an inactive-for-this-shape group: always
+# exactly 0.0, uniformly, regardless of group -- see module docstring for
+# why (0 unambiguously marks "not applicable", both in the stored vector
+# and in what gets rendered).
+ZERO_DEFAULTS = {
+    "shape":   {},                            # shape is never "zeroed" -- see below
+    "color":   {"r": 0.0, "g": 0.0, "b": 0.0},
+    "size":    {"size": 0.0},
+    "stripes": {"h_stripe": 0.0, "v_stripe": 0.0},
+    "grain":   {"grain": 0.0},
 }
 
 
@@ -151,6 +207,19 @@ def _resolve_features(features: Union[str, Sequence[str], None]) -> List[str]:
 
     # de-duplicate while imposing canonical order
     return [g for g in FEATURE_ORDER if g in requested]
+
+
+def _resolve_per_shape(spec: Optional[str], fallback: List[str]) -> List[str]:
+    """Resolves a per-shape --*_features override. None falls back to the
+    dataset's global --features baseline ("10 dims is the default" for any
+    shape you don't explicitly override). 'shape' is always force-included
+    regardless of what's specified -- every image has exactly one rendered
+    shape no matter which other feature groups apply to it, so there's no
+    sensible way to "zero out" shape identity itself."""
+    resolved = list(fallback) if spec is None else _resolve_features(spec)
+    if "shape" not in resolved:
+        resolved = _resolve_features(["shape"] + resolved)
+    return resolved
 
 
 def _active_columns(active_features: Sequence[str]) -> List[int]:
@@ -209,7 +278,9 @@ class SampleVector64:
 
     def to_list(self):
         """Full 10-dim factor vector (canonical order). Used internally for
-        rendering; storage uses only the active-feature subset."""
+        rendering; storage uses only the active-feature subset (global
+        --features mode) or the full vector as-is with zeros for
+        inactive-for-this-shape groups already applied (per-shape mode)."""
         one_hot = [0.0, 0.0, 0.0]
         one_hot[self.shape_id] = 1.0
         return one_hot + [self.r, self.g, self.b, self.size,
@@ -355,6 +426,9 @@ class DatasetConfig64:
     perturb:      bool           = True
     dead_zone:    float          = 0.1
     features:     str            = ",".join(FEATURE_ORDER)
+    triangle_features: Optional[str] = None
+    square_features:   Optional[str] = None
+    circle_features:   Optional[str] = None
     cache:        bool           = True
     fix_shape:    Optional[int]  = None
     fix_r:        Optional[float]= None
@@ -375,46 +449,81 @@ class DatasetGenerator64:
     def __init__(self, output_dir="data_64", n_samples=20000, seed=42,
                  image_format="PNG", num_workers=0, verbose=True,
                  perturb=True, dead_zone=0.1, features=None, cache=True,
+                 triangle_features=None, square_features=None, circle_features=None,
                  fix_shape=None, fix_r=None, fix_g=None, fix_b=None,
                  fix_size=None, fix_h_stripe=None, fix_v_stripe=None, fix_grain=None):
         active_features = _resolve_features(features)
+
+        # Per-shape mode activates the moment ANY of the three per-shape
+        # overrides is given; otherwise behavior is 100% identical to
+        # before (global --features, vector shrinks to active columns).
+        self.per_shape_mode = any(x is not None for x in
+                                  (triangle_features, square_features, circle_features))
+        self.per_shape_features = {
+            0: _resolve_per_shape(triangle_features, active_features),  # triangle
+            1: _resolve_per_shape(square_features, active_features),    # square
+            2: _resolve_per_shape(circle_features, active_features),    # circle
+        }
+
         self.cfg = DatasetConfig64(
             output_dir=output_dir, n_samples=n_samples, seed=seed,
             image_format=image_format, num_workers=num_workers,
             verbose=verbose, perturb=perturb, dead_zone=dead_zone,
             features=",".join(active_features), cache=cache,
+            triangle_features=triangle_features, square_features=square_features,
+            circle_features=circle_features,
             fix_shape=fix_shape, fix_r=fix_r, fix_g=fix_g, fix_b=fix_b,
             fix_size=fix_size, fix_h_stripe=fix_h_stripe,
             fix_v_stripe=fix_v_stripe, fix_grain=fix_grain,
         )
         self.active_features = active_features
-        self.active_vector_columns = _active_vector_columns(active_features)
-        self.active_dim = len(self.active_vector_columns)
+
+        if self.per_shape_mode:
+            # ALWAYS full width in this mode -- this is the entire point:
+            # every image gets the same conditioning vector dimensionality
+            # regardless of which shape (and therefore which feature
+            # subset) generated it. Inactive-for-this-shape dims are 0.0
+            # within that full vector, not dropped from it.
+            self.active_vector_columns = FULL_COLUMNS
+            self.active_dim = FULL_DIM
+        else:
+            self.active_vector_columns = _active_vector_columns(active_features)
+            self.active_dim = len(self.active_vector_columns)
+
         self._rng = random.Random(seed)
 
-    def _apply_group_defaults(self, v: SampleVector64) -> None:
-        """For any excluded feature group, force its attribute(s) to a
-        neutral constant — unless a --fix_* override already set it."""
+    def _apply_group_defaults(self, v: SampleVector64, active_features: Sequence[str]) -> None:
+        """For any feature group NOT in `active_features` (the set
+        applicable to THIS sample -- shape-dependent in per-shape mode,
+        global otherwise), force its attribute(s) to a default -- unless a
+        --fix_* override already set it explicitly, which always wins.
+        Per-shape mode zeros everything uniformly (see ZERO_DEFAULTS and
+        the module docstring for why); global mode keeps the original
+        neutral GROUP_DEFAULTS values, unchanged, for backward
+        compatibility."""
         fix = self.cfg
-        active = self.active_features
+        defaults = ZERO_DEFAULTS if self.per_shape_mode else GROUP_DEFAULTS
 
-        if "shape" not in active and fix.fix_shape is None:
+        if "shape" not in active_features and fix.fix_shape is None:
+            # Only reachable in global mode (a per-shape active_features
+            # set always force-includes "shape") -- shape can't sensibly
+            # be "zeroed", every image has exactly one rendered shape.
             v.shape_id = GROUP_DEFAULTS["shape"]["shape_id"]
 
-        if "color" not in active:
-            if fix.fix_r is None: v.r = GROUP_DEFAULTS["color"]["r"]
-            if fix.fix_g is None: v.g = GROUP_DEFAULTS["color"]["g"]
-            if fix.fix_b is None: v.b = GROUP_DEFAULTS["color"]["b"]
+        if "color" not in active_features:
+            if fix.fix_r is None: v.r = defaults["color"]["r"]
+            if fix.fix_g is None: v.g = defaults["color"]["g"]
+            if fix.fix_b is None: v.b = defaults["color"]["b"]
 
-        if "size" not in active and fix.fix_size is None:
-            v.size = GROUP_DEFAULTS["size"]["size"]
+        if "size" not in active_features and fix.fix_size is None:
+            v.size = defaults["size"]["size"]
 
-        if "stripes" not in active:
-            if fix.fix_h_stripe is None: v.h_stripe = GROUP_DEFAULTS["stripes"]["h_stripe"]
-            if fix.fix_v_stripe is None: v.v_stripe = GROUP_DEFAULTS["stripes"]["v_stripe"]
+        if "stripes" not in active_features:
+            if fix.fix_h_stripe is None: v.h_stripe = defaults["stripes"]["h_stripe"]
+            if fix.fix_v_stripe is None: v.v_stripe = defaults["stripes"]["v_stripe"]
 
-        if "grain" not in active and fix.fix_grain is None:
-            v.grain = GROUP_DEFAULTS["grain"]["grain"]
+        if "grain" not in active_features and fix.fix_grain is None:
+            v.grain = defaults["grain"]["grain"]
 
     def generate(self):
         out_dir = Path(self.cfg.output_dir)
@@ -434,11 +543,24 @@ class DatasetGenerator64:
             if fix.fix_v_stripe is not None: v.v_stripe  = fix.fix_v_stripe
             if fix.fix_grain    is not None: v.grain     = fix.fix_grain
 
-            self._apply_group_defaults(v)
+            # Which feature groups apply to THIS sample: shape-dependent
+            # in per-shape mode (looked up after fix_shape is applied, so
+            # a forced shape correctly picks up ITS OWN config), the
+            # single global set otherwise.
+            sample_active_features = (
+                self.per_shape_features[v.shape_id] if self.per_shape_mode
+                else self.active_features
+            )
+            self._apply_group_defaults(v, sample_active_features)
 
             full_vec_list = v.to_list()
-            active_vec_list = _extract_active(full_vec_list, self.active_features)
-            job_args.append((i, full_vec_list, active_vec_list, self.active_features,
+            if self.per_shape_mode:
+                # already zero-padded above -- store the full vector as-is
+                stored_vec_list = full_vec_list
+            else:
+                stored_vec_list = _extract_active(full_vec_list, self.active_features)
+
+            job_args.append((i, full_vec_list, stored_vec_list, sample_active_features,
                              str(img_dir), self.cfg.image_format, self.cfg.perturb,
                              self.cfg.dead_zone, self.cfg.cache))
         nw = self.cfg.num_workers
@@ -456,12 +578,9 @@ class DatasetGenerator64:
         del mmap
         (out_dir / "filenames.txt").write_text("\n".join(filenames))
 
-        disabled = [g for g in FEATURE_ORDER if g not in self.active_features]
-        (out_dir / "vectors_meta.json").write_text(json.dumps({
+        meta = {
             "shape": [N, self.active_dim], "dtype": "float32",
             "columns": self.active_vector_columns,
-            "features": self.active_features,
-            "disabled_features": disabled,
             "full_schema": FULL_COLUMNS,
             "perturbation": {
                 "dead_zone": self.cfg.dead_zone,
@@ -470,19 +589,38 @@ class DatasetGenerator64:
                     f"v >= {1-self.cfg.dead_zone}. "
                     "Linear interpolation to max width at v=0.5. "
                     "Set dead_zone=0.0 for original behaviour. "
-                    "Disabled feature groups are never perturbed (held exactly constant)."
+                    "Inactive feature groups (global mode: dropped from the "
+                    "vector; per-shape mode: zeroed within the full vector) "
+                    "are never perturbed (held exactly constant)."
                 ),
             },
-        }, indent=2))
+        }
+        if self.per_shape_mode:
+            meta["per_shape_mode"] = True
+            meta["per_shape_features"] = {
+                SHAPE_NAMES[sid]: feats for sid, feats in self.per_shape_features.items()
+            }
+        else:
+            meta["features"] = self.active_features
+            meta["disabled_features"] = [g for g in FEATURE_ORDER if g not in self.active_features]
+        (out_dir / "vectors_meta.json").write_text(json.dumps(meta, indent=2))
         (out_dir / "config.json").write_text(json.dumps(self.cfg.to_dict(), indent=2))
+
         if self.cfg.verbose:
             nw_str = f"{nw} workers" if nw > 0 else "single-process"
             print(f"\n✓ {N} images → {out_dir}/images/ ({nw_str})")
             print(f"✓ vectors   → {out_dir}/vectors.npy {vec_arr.shape} float32")
-            print(f"  Active features : {self.active_features}  (dim={self.active_dim})")
-            print(f"  Columns         : {self.active_vector_columns}")
-            if disabled:
-                print(f"  Disabled        : {disabled} (fixed constant, no rendered variation)")
+            if self.per_shape_mode:
+                print(f"  Per-shape mode: every vector is full {FULL_DIM}-dim; "
+                      f"inactive-for-that-shape dims are 0.0")
+                for sid, feats in self.per_shape_features.items():
+                    print(f"    {SHAPE_NAMES[sid]:<9}: {feats}")
+            else:
+                print(f"  Active features : {self.active_features}  (dim={self.active_dim})")
+                print(f"  Columns         : {self.active_vector_columns}")
+                disabled = [g for g in FEATURE_ORDER if g not in self.active_features]
+                if disabled:
+                    print(f"  Disabled        : {disabled} (fixed constant, no rendered variation)")
 
             if "is_triangle" in self.active_vector_columns:
                 ci = {name: self.active_vector_columns.index(name)
@@ -539,6 +677,8 @@ class ShapeDataset64:
         vec_dim = meta["shape"][1]
         self.vector_columns = meta["columns"]
         self.active_features = meta.get("features", FEATURE_ORDER)
+        self.per_shape_mode = meta.get("per_shape_mode", False)
+        self.per_shape_features = meta.get("per_shape_features")
 
         images_np = np.load(self.root / "images_cached.npy")
         if max_samples is not None:
@@ -593,7 +733,20 @@ if __name__ == "__main__":
                              f"{FEATURE_ORDER}. Excluded groups are fixed to a "
                              "neutral constant and dropped from vectors.npy — e.g. "
                              "--features shape,color,size gives a 7-dim manifold "
-                             "with no texture variation at all.")
+                             "with no texture variation at all. This is the "
+                             "fallback baseline for any shape not given its own "
+                             "--*_features override below.")
+    parser.add_argument("--triangle_features", default=None, type=str,
+                        help="Per-shape override for triangles, same syntax as "
+                             "--features (e.g. 'shape,color,size'). Activates "
+                             "per-shape mode: EVERY stored vector becomes full "
+                             f"{FULL_DIM}-dim regardless of shape, with any "
+                             "inactive-for-that-shape dims set to 0.0 rather than "
+                             "dropped. Omit to use --features for triangles too.")
+    parser.add_argument("--square_features", default=None, type=str,
+                        help="Per-shape override for squares. See --triangle_features.")
+    parser.add_argument("--circle_features", default=None, type=str,
+                        help="Per-shape override for circles. See --triangle_features.")
     parser.add_argument("--fix_shape",    default=None, type=int, choices=[0,1,2])
     parser.add_argument("--fix_r",        default=None, type=float)
     parser.add_argument("--fix_g",        default=None, type=float)
@@ -613,6 +766,9 @@ if __name__ == "__main__":
             num_workers=args.num_workers, verbose=True,
             perturb=not args.no_perturb, dead_zone=args.dead_zone,
             features=args.features, cache=not args.no_cache,
+            triangle_features=args.triangle_features,
+            square_features=args.square_features,
+            circle_features=args.circle_features,
             fix_shape=args.fix_shape, fix_r=args.fix_r,
             fix_g=args.fix_g, fix_b=args.fix_b, fix_size=args.fix_size,
             fix_h_stripe=args.fix_h_stripe, fix_v_stripe=args.fix_v_stripe,

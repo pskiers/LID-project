@@ -4,17 +4,40 @@ collect_gradients.py
 Computes gradients of pairwise image losses with respect to conditioner
 output embeddings. Saves gradient matrix for subsequent PCA analysis.
 
+Implements ELROND's Eq. 1-4 exactly (Skiers et al., "ELROND: Exploring
+and decomposing intrinsic capabilities of diffusion models"): a ONE-STEP
+closed-form x0 estimate, not a multi-step denoising trajectory.
+
 For each pair (image_A, vector_A) and (image_B, vector_B):
-  1. Noise image_A to timestep t
-  2. Denoise with UNet conditioned on vector_A — grad tracked on conditioner output
-  3. Compute MSE loss against image_B
-  4. Backprop → gradient w.r.t. conditioner output (64-dim)
+  1. Noise image_A to timestep t                                    (Eq. 1)
+  2. ONE UNet call at exactly t, conditioned on vector_A -- grad
+     tracked on conditioner output -- closed-form clean-image
+     estimate: x0_hat = (z_t - sigma_t * eps_theta(z_t,t,c)) / alpha_t
+     with alpha_t = sqrt(alphas_cumprod[t]), sigma_t = sqrt(1-alphas_cumprod[t])
+                                                                       (Eq. 2)
+  3. MSE loss between x0_hat and the RAW target image_B (not a
+     denoised version of it)                                        (Eq. 3)
+  4. Backprop -> gradient w.r.t. conditioner output                 (Eq. 4)
+
+No multi-step DDIM trajectory anywhere -- one model call per gradient,
+always evaluated at exactly the declared timestep. (An earlier version
+of this script ran a full multi-step denoising loop instead, which is
+NOT what ELROND's method specifies -- see Eq. 2's own text: "at any
+timestep t, an estimate of the clean latent can be predicted from the
+current noisy state and the model prediction" -- and required extra
+machinery to keep the declared and actual noise levels consistent
+across a fixed schedule. That machinery -- and the failure mode it was
+fixing -- doesn't exist here, since there's no schedule to go wrong.)
 
 Runs for each specified timestep independently.
 Different timesteps capture different levels of abstraction:
   - high t (e.g. 700): coarse structure, shape
   - mid  t (e.g. 500): mid-level features
   - low  t (e.g. 300): fine details, texture
+Per ELROND Appendix C, gradients collected at high noise levels
+(t approx num_train_timesteps) tend to be the most semantically rich,
+since the model relies most heavily on the conditioning to reconstruct
+the image at that point.
 
 Conditioning dimensionality is FLEXIBLE via --cond_input_dim (default 10,
 matching the original shape+rgb+size+stripe+grain dataset). Set it to 7 for
@@ -44,6 +67,7 @@ Usage:
 
 import argparse
 import inspect
+import json
 import random
 import time
 from pathlib import Path
@@ -51,13 +75,13 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import DDIMScheduler, DDPMScheduler, UNet2DConditionModel
+from diffusers import DDPMScheduler, UNet2DConditionModel
 from PIL import Image
 from torchvision.transforms.functional import to_tensor
 
 from configs.config_64 import Config64 as Config
 from models.conditioner import ShapeConditioningEncoder
-from dataset_64 import SampleVector64, ImageGenerator64
+from dataset_64_update import SampleVector64, ImageGenerator64
 
 
 # Canonical feature ordering. --cond_input_dim N takes the first N of these —
@@ -105,15 +129,13 @@ def default_prompt_for(cond_input_dim: int) -> list:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default="outputs/checkpoints/outputs_64_acc_update1/checkpoint-epoch-0200")
-    parser.add_argument("--data_dir",   type=str, default="outputs/samples_for_grads/circle_only_text_update1",
+    parser.add_argument("--checkpoint", type=str, default="/net/scratch/hscra/plgrid/plgekaczmarczyk/LID-project/synthetic_dataset/outputs/checkpoints/outputs_64_acc_random/checkpoint-epoch-0200/")
+    parser.add_argument("--data_dir",   type=str, default="outputs/samples_for_grads/circle",
                         help="Folder with 000000.png ... and vectors.npy")
-    parser.add_argument("--out_dir",    type=str, default="outputs/gradients/t_mult_only_text_5k_update1")
-    parser.add_argument("--num_steps",  type=int, default=10,
-                        help="DDIM steps for denoising")
+    parser.add_argument("--out_dir",    type=str, default="outputs/gradients/t_mult_circle")
     parser.add_argument("--n_pairs",    type=int, default=5000,
                         help="Number of pairs to compute gradients for")
-    parser.add_argument("--timesteps",  type=int, nargs="+", default=[999,900,800,700,600,500, 50],
+    parser.add_argument("--timesteps",  type=int, nargs="+", default=[999,900,800,700,600,50],
                         help="Noise timestep(s) to run, e.g. --timesteps 500 or --timesteps 100 300 500 700")
     parser.add_argument("--cond_input_dim", type=int, default=10,
                         help="Conditioner input dimensionality. Default 10 matches the "
@@ -121,13 +143,13 @@ def parse_args():
                              "the no-texture variant (shape+rgb+size, stripe/grain columns "
                              "dropped entirely). Determines both --prompt's expected length "
                              "and which SampleVector64 kwargs get passed in --average_anchor mode.")
-    parser.add_argument("--prompt",     type=float, nargs="+", default=None,
+    parser.add_argument("--prompt",     type=float, nargs="+", default=[0, 0, 1, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 , 0.5],
                         help="Conditioning vector for anchor image. Length must equal "
                              "--cond_input_dim. If omitted, a sensible default is built "
                              "automatically (circle shape, full-value color/size, neutral "
                              "0.5 for any stripe/grain dims present). Feature order: "
                              + ", ".join(FEATURE_NAMES_FULL) + " (first --cond_input_dim of these).")
-    parser.add_argument("--average_anchor", action="store_true", default=True,
+    parser.add_argument("--average_anchor", action="store_true", default=False,
                         help="If set, anchor image is a deterministically rendered average image "
                              "(all continuous features set to 0.5, shape taken from --prompt)")
     parser.add_argument("--multiple_anchors", action="store_true", default=True,
@@ -167,7 +189,15 @@ def load_dataset(data_dir):
 
 
 # ---------------------------------------------------------------------------
-# Noising + denoising
+# Noising + one-step x0 prediction (ELROND Eq. 1-2, verified against the
+# ELROND paper's own text: "at any timestep t, an estimate of the clean
+# latent x0-hat can be predicted from the current noisy state z_t and the
+# model prediction: x0-hat(z_t,t,c) = (z_t - sigma_t*eps_theta(z_t,t,c)) /
+# alpha_t" -- ONE model call, closed-form, no multi-step DDIM trajectory.
+# This replaces the previous multi-step denoise_with_grad (and its
+# resume_from_timestep fix) entirely: there is no fixed schedule to
+# resume within anymore, so that whole class of bug can't occur here --
+# every gradient is computed at exactly the declared timestep, always.
 # ---------------------------------------------------------------------------
 
 def noise_image(image, timestep, scheduler, device, seed):
@@ -177,12 +207,25 @@ def noise_image(image, timestep, scheduler, device, seed):
     return scheduler.add_noise(image, noise, t)
 
 
-def denoise_with_grad(unet, cond_out, noisy_image, ddim):
-    image = noisy_image.clone()
-    for t in ddim.timesteps:
-        noise_pred = unet(image, t, encoder_hidden_states=cond_out).sample
-        image      = ddim.step(noise_pred, t, image).prev_sample
-    return image
+def predict_x0(unet, cond_out, noisy_image, timestep, scheduler):
+    """ELROND Eq. 2: x0-hat = (z_t - sigma_t * eps_theta(z_t, t, c)) / alpha_t,
+    with alpha_t = sqrt(alphas_cumprod[t]), sigma_t = sqrt(1-alphas_cumprod[t]).
+    ONE U-Net call, no iteration -- `scheduler` only needs alphas_cumprod
+    (populated by any DDPMScheduler/DDIMScheduler config with the same
+    beta schedule; no set_timesteps() call needed here at all, since
+    there's no multi-step trajectory to configure).
+    Deliberately NOT clamped to [-1,1] (unlike visualize_x0.py's own
+    predict_x0, which clamps purely for display) -- clamping is a
+    saturating op that would zero the gradient for any pixel whose
+    estimate falls outside that range, and Eq. 2 as stated in the paper
+    has no clamp in it.
+    """
+    t_tensor = torch.tensor([timestep], device=noisy_image.device)
+    noise_pred = unet(noisy_image, t_tensor, encoder_hidden_states=cond_out).sample
+    alpha_prod = scheduler.alphas_cumprod[timestep]
+    alpha_t = alpha_prod ** 0.5
+    sigma_t = (1 - alpha_prod) ** 0.5
+    return (noisy_image - sigma_t * noise_pred) / alpha_t
 
 
 def build_average_anchor_vector(prompt, feature_names):
@@ -222,6 +265,41 @@ def build_average_anchor_vector(prompt, feature_names):
     return avg_vec
 
 
+def save_run_config(args: argparse.Namespace, out_dir: Path) -> Path:
+    """Saves every CLI parameter used for this run into the SAME directory
+    where the resulting grads_t*.npy files get saved -- so any gradient
+    file can always be traced back to exactly what configuration produced
+    it (checkpoint, timesteps, seed, cond_input_dim, prompt, etc.) without
+    having to guess from context or remember which run it was.
+
+    Saves both:
+      - run_config.txt  (plain "key: value" lines, quick to eyeball)
+      - run_config.json (same data, structured -- for any downstream
+        script, e.g. pca_analysis.py/vaease.py/sanity_check_gradients.py,
+        that wants to programmatically check what a given grads_t*.npy
+        was actually collected with, matching the .json-metadata
+        convention already used elsewhere in this project, e.g.
+        vectors_meta.json)
+
+    Returns the path to the saved .json file.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    params = {k: v for k, v in vars(args).items() if not k.startswith("_")}
+
+    config_txt = "\n".join(f"{k}: {v}" for k, v in params.items())
+    (out_dir / "run_config.txt").write_text(config_txt)
+
+    # argparse-produced values are already plain Python types (str, int,
+    # float, bool, list), so this should always serialize cleanly; the
+    # default=str fallback is just a safety net against some future
+    # non-serializable arg type crashing the whole run over a metadata
+    # save, rather than something expected to trigger here.
+    json_path = out_dir / "run_config.json"
+    json_path.write_text(json.dumps(params, indent=2, default=str))
+    return json_path
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -236,10 +314,8 @@ def main():
 
     print(f"Conditioning dim: {args.cond_input_dim}  |  feature order: {args._feature_names}")
 
-    # save run config
-    config_txt = "\n".join(f"{k}: {v}" for k, v in vars(args).items() if not k.startswith("_"))
-    (out_dir / "run_config.txt").write_text(config_txt)
-    print(f"Saved run config → {out_dir / 'run_config.txt'}")
+    config_path = save_run_config(args, out_dir)
+    print(f"Saved run config → {out_dir / 'run_config.txt'} and {config_path}")
 
     # ------------------------------------------------------------------
     # Load models
@@ -265,8 +341,10 @@ def main():
         beta_schedule=cfg.beta_schedule,
         prediction_type=cfg.prediction_type,
     )
-    ddim = DDIMScheduler.from_config(ddpm.config)
-    ddim.set_timesteps(args.num_steps)
+    # No DDIMScheduler / set_timesteps() needed -- ELROND's Eq. 2 is a
+    # single closed-form model call per gradient, not a multi-step
+    # trajectory. ddpm.alphas_cumprod (populated at construction, from
+    # the beta schedule) is all predict_x0 needs.
 
     # ------------------------------------------------------------------
     # Load dataset + sample pairs (same pairs for all timesteps)
@@ -332,14 +410,18 @@ def main():
             noisy_a  = noise_image(img_a_p, noise_t, ddpm, device, seed=args.seed + pair_idx)
             cond_out = conditioner(vec_a_p.unsqueeze(0).to(device)).detach().requires_grad_(True)
 
-            denoised_a = denoise_with_grad(unet, cond_out, noisy_a, ddim)
-            loss       = F.mse_loss(denoised_a.float(), img_b.float())
+            # ELROND Eq. 2-4: one-step x0-hat prediction, MSE against the
+            # RAW target image_b (not a denoised version of it), backprop
+            # to cond_out. No multi-step trajectory, no schedule to resume
+            # within -- every gradient is computed at exactly noise_t.
+            x0_pred = predict_x0(unet, cond_out, noisy_a, noise_t, ddpm)
+            loss    = F.mse_loss(x0_pred.float(), img_b.float())
             loss.backward()
 
             if cond_out.grad is not None:
                 all_grads.append(cond_out.grad.squeeze().detach().cpu().numpy())
 
-            del noisy_a, cond_out, denoised_a, loss
+            del noisy_a, cond_out, x0_pred, loss
             if args.multiple_anchors:
                 del img_a_p
             torch.cuda.empty_cache()

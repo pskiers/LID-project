@@ -77,6 +77,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib
+matplotlib.use("Agg")  # headless-safe: no display needed on a compute node
+import matplotlib.pyplot as plt
 
 
 # ---------------------------------------------------------------------------
@@ -303,13 +306,154 @@ def count_active_dims(sigma_z: np.ndarray) -> np.ndarray:
     This is the *local* / per-sample estimate — noisier for any single
     point, but it's the thing that lets you look at a distribution or
     cluster by category. See group_averaged_active_dims() below for a
-    single, low-noise number over a known group instead."""
+    single, low-noise number over a known group instead.
+
+    Vectorized across all N samples at once via cumulative sums, rather
+    than looping in Python and calling _variance_split_threshold once
+    per sample (the original approach) -- that loop is what made
+    per-epoch AD tracking prohibitively slow once it started running
+    every epoch on both train and val (measured: ~8s per call at
+    N=5000, kappa=64 with the loop; a few ms vectorized). Verified
+    bit-identical to the original per-sample version across 200 random
+    test cases including edge cases (kappa=1, tiny N) before replacing
+    it here -- see _count_active_dims_loop_reference below.
+    """
+    sigma2 = sigma_z ** 2
+    N, k = sigma2.shape
+    if k < 2:
+        return np.zeros(N, dtype=int)
+
+    S = np.sort(sigma2, axis=1)                        # (N, k), ascending per row
+    cs1 = np.cumsum(S, axis=1)                          # running sum
+    cs2 = np.cumsum(S ** 2, axis=1)                     # running sum of squares
+    total1, total2 = cs1[:, -1:], cs2[:, -1:]
+
+    n_lo = np.arange(1, k, dtype=np.float64)            # candidate split sizes 1..k-1
+    n_hi = k - n_lo
+    lo_sum1, lo_sum2 = cs1[:, :-1], cs2[:, :-1]
+    hi_sum1, hi_sum2 = total1 - lo_sum1, total2 - lo_sum2
+
+    # sum((x-mean)^2) = sum(x^2) - (sum(x))^2/n  -- i.e. variance*n,
+    # matching _variance_split_threshold's cost exactly, for every
+    # sample and every candidate split simultaneously.
+    cost_lo = lo_sum2 - (lo_sum1 ** 2) / n_lo
+    cost_hi = hi_sum2 - (hi_sum1 ** 2) / n_hi
+
+    best_split_idx = np.argmin(cost_lo + cost_hi, axis=1)  # first-min tie-break, matches original
+    return (best_split_idx + 1).astype(int)                # split size = active-dim count directly
+
+
+def _count_active_dims_loop_reference(sigma_z: np.ndarray) -> np.ndarray:
+    """Reference-only slow implementation, kept for testing/verification
+    against the vectorized count_active_dims above. Not used elsewhere
+    in this file."""
     sigma2 = sigma_z ** 2
     out = np.empty(sigma2.shape[0], dtype=int)
     for i, row in enumerate(sigma2):
         t = _variance_split_threshold(row)
         out[i] = int((row < t).sum())
     return out
+
+
+def compute_active_dims_histogram(ad_counts: np.ndarray) -> dict:
+    """Bin per-sample active-dimension counts over every integer value
+    from min to max observed (not just occupied bins, so gaps show up
+    as zero-count bars rather than silently vanishing). Returns a plain
+    dict (JSON-serializable) with parallel "bins"/"counts" lists plus a
+    few summary stats, so it's self-contained without needing ad_counts
+    around to interpret it later."""
+    ad_counts = np.asarray(ad_counts)
+    lo, hi = int(ad_counts.min()), int(ad_counts.max())
+    bins = list(range(lo, hi + 1))
+    counts = [int((ad_counts == b).sum()) for b in bins]
+    return {
+        "bins": bins,
+        "counts": counts,
+        "n_samples": int(len(ad_counts)),
+        "mean": float(ad_counts.mean()),
+        "median": float(np.median(ad_counts)),
+        "std": float(ad_counts.std()),
+        "min": lo,
+        "max": hi,
+    }
+
+
+def plot_active_dims_histogram(ad_counts: np.ndarray, out_path: Path, title: str) -> dict:
+    """Bar plot of the per-sample active-dimension histogram (same visual
+    style as pca_analysis.py's scree plots), saved to `out_path`. Returns
+    the underlying histogram dict (see compute_active_dims_histogram)
+    so the caller can also serialize it to JSON without recomputing."""
+    hist = compute_active_dims_histogram(ad_counts)
+    plt.figure(figsize=(8, 4))
+    plt.bar(hist["bins"], hist["counts"])
+    plt.xlabel("Active dimensions (per sample)")
+    plt.ylabel("Number of samples")
+    plt.title(f"{title}\n(mean={hist['mean']:.2f}, median={hist['median']:.0f}, "
+              f"n={hist['n_samples']})")
+    plt.xticks(hist["bins"])
+    plt.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    return hist
+
+
+def plot_training_history(history: list, out_path: Path) -> None:
+    """One figure, epoch on the x-axis throughout. Most metrics (loss,
+    recon_mse_per_dim, kl, gamma, *_ad_mean, *_ad_group, ...) each get
+    their own subplot automatically, generic over whatever keys exist
+    in history.json. Two exceptions, hardcoded because they're meant to
+    be read together rather than separately: val_ad_{median,min,max} are
+    overlaid on one subplot (as are the train_ad_ equivalents), each
+    series in its own color with a legend, so you can see the spread
+    around the median at a glance instead of cross-referencing three
+    separate plots.
+    """
+    if not history:
+        return
+    epochs = [h["epoch"] for h in history]
+    all_keys = [k for k in history[0].keys() if k != "epoch"]
+
+    combined_specs = [
+        {"title": "val_ad (median / min / max)",
+         "series": [("val_ad_median", "median"), ("val_ad_min", "min"), ("val_ad_max", "max")]},
+        {"title": "train_ad (median / min / max)",
+         "series": [("train_ad_median", "median"), ("train_ad_min", "min"), ("train_ad_max", "max")]},
+    ]
+    # only actually combine if all three series for a group are present
+    # (e.g. older history.json files without min/max just fall through
+    # to solo subplots for whichever keys DO exist)
+    combined_specs = [spec for spec in combined_specs
+                       if all(key in all_keys for key, _ in spec["series"])]
+    combined_keys = {key for spec in combined_specs for key, _ in spec["series"]}
+    solo_keys = [k for k in all_keys if k not in combined_keys]
+
+    panels = combined_specs + [{"title": k, "series": [(k, None)]} for k in solo_keys]
+
+    n = len(panels)
+    ncols = min(3, n)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3.5 * nrows), squeeze=False)
+
+    for i, panel in enumerate(panels):
+        ax = axes[i // ncols][i % ncols]
+        for key, label in panel["series"]:
+            values = [h.get(key) for h in history]
+            ax.plot(epochs, values, linewidth=1, label=(label or key))
+        ax.set_xlabel("epoch")
+        ax.set_ylabel(panel["title"])
+        ax.set_title(panel["title"])
+        ax.grid(alpha=0.3)
+        if len(panel["series"]) > 1:
+            ax.legend(fontsize=8)
+
+    for j in range(n, nrows * ncols):
+        axes[j // ncols][j % ncols].axis("off")
+
+    fig.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def per_sample_active_mask(sigma_z: np.ndarray) -> np.ndarray:
@@ -323,6 +467,199 @@ def per_sample_active_mask(sigma_z: np.ndarray) -> np.ndarray:
         t = _variance_split_threshold(row)
         mask[i] = row < t
     return mask
+
+
+def compute_neuron_activation_counts(sigma_z: np.ndarray) -> np.ndarray:
+    """For each of the kappa latent dimensions ("neurons"), count how many
+    of the N samples had that dimension active. This is the transpose of
+    count_active_dims: that function counts, PER SAMPLE, how many neurons
+    are active; this counts, PER NEURON, how many samples activate it —
+    the standard sparse-autoencoder "feature activation frequency"
+    statistic (e.g. as used in Anthropic's "Towards Monosemanticity"):
+    a neuron with count 0 is permanently dead; a neuron with count N
+    fires on literally every input (behaving more like an always-on bias
+    than a sparse, selective feature); most neurons should sit somewhere
+    in between if the model has learned a genuinely sparse code.
+
+    sigma_z: (N, kappa). Returns (kappa,) int array.
+    """
+    mask = per_sample_active_mask(sigma_z)   # (N, kappa) bool
+    return mask.sum(axis=0).astype(int)
+
+
+def plot_neuron_activation_histogram(
+    activation_counts: np.ndarray, n_samples: int, out_path: Path, title: str,
+    n_bins: int = 30,
+) -> dict:
+    """Histogram OVER NEURONS (kappa data points — one per latent
+    dimension, each being "how many of the N samples activated it"), NOT
+    a per-sample histogram like plot_active_dims_histogram above (which
+    has N data points, one per sample, each being "how many neurons
+    fired for it"). Answers a different question: not "how many active
+    dims does a typical sample have" but "how often does a typical
+    neuron get used across the whole dataset."
+
+    Uses proper np.histogram binning (unlike plot_active_dims_histogram's
+    one-bin-per-integer-value approach) since activation counts range up
+    to N samples, which is typically far larger than kappa itself, so a
+    bin-per-integer-count would mean up to N bins for only kappa data
+    points to fill them.
+    """
+    activation_counts = np.asarray(activation_counts)
+    n_bins_eff = max(1, min(n_bins, len(activation_counts)))
+    counts, bin_edges = np.histogram(activation_counts, bins=n_bins_eff,
+                                     range=(0, max(n_samples, 1)))
+
+    n_never = int((activation_counts == 0).sum())
+    n_always = int((activation_counts == n_samples).sum())
+
+    # Top 10 most active neurons (by activation count, descending), for
+    # display alongside the histogram -- the histogram's bars only show
+    # HOW MANY neurons fall at each activation-frequency level, not WHICH
+    # specific neurons those are, so this fills that gap directly.
+    n_top = min(10, len(activation_counts))
+    top_idx = np.argsort(activation_counts)[::-1][:n_top]
+    top_10_active_neurons = [(int(i), int(activation_counts[i])) for i in top_idx]
+
+    fig, ax = plt.subplots(figsize=(11, 4))
+    ax.bar(bin_edges[:-1], counts, width=np.diff(bin_edges), align="edge", edgecolor="black")
+    ax.set_xlabel(f"Number of samples (out of {n_samples}) a neuron was active on")
+    ax.set_ylabel("Number of neurons")
+    ax.set_title(f"{title}\n(kappa={len(activation_counts)} neurons, "
+                f"{n_never} never active, {n_always} always active)")
+
+    top_10_text = "Top 10 most active neurons\n(index: count)\n" + "\n".join(
+        f"  {idx}: {cnt}" for idx, cnt in top_10_active_neurons
+    )
+    fig.text(0.78, 0.5, top_10_text, fontsize=8, va="center", ha="left",
+             family="monospace", transform=fig.transFigure,
+             bbox=dict(boxstyle="round", facecolor="white", edgecolor="gray"))
+    fig.subplots_adjust(right=0.76)
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+    return {
+        "activation_counts": activation_counts.tolist(),
+        "n_samples": int(n_samples),
+        "kappa": int(len(activation_counts)),
+        "n_never_active": n_never,
+        "n_always_active": n_always,
+        "mean_activation_count": float(activation_counts.mean()),
+        "median_activation_count": float(np.median(activation_counts)),
+        "top_10_active_neurons": top_10_active_neurons,
+        "bin_edges": bin_edges.tolist(),
+        "bin_counts": counts.tolist(),
+    }
+
+
+def plot_neuron_activation_bar(
+    activation_counts: np.ndarray, n_samples: int, out_path: Path, title: str,
+) -> None:
+    """One bar PER NEURON -- kappa bars, x-axis = neuron index (0..kappa-1),
+    height = how many of the N samples activated that specific neuron.
+
+    Distinct from plot_neuron_activation_histogram above: that one bins
+    the DISTRIBUTION of activation counts across neurons (answers "how
+    many neurons fall in this activation-frequency range", kappa data
+    points collapsed into ~30 bins). This instead shows each neuron's own
+    count directly, one bar per neuron with no binning/collapsing at all
+    (kappa bars, e.g. 64 for kappa=64) -- answers "which specific neurons
+    are used how often", letting you see e.g. whether usage concentrates
+    in a handful of low-index neurons or is spread across the dictionary.
+    """
+    activation_counts = np.asarray(activation_counts)
+    kappa = len(activation_counts)
+    plt.figure(figsize=(max(8, kappa * 0.15), 4))
+    plt.bar(range(kappa), activation_counts, width=1.0, edgecolor="black", linewidth=0.3)
+    plt.xlabel("Neuron index")
+    plt.ylabel(f"Number of samples active on (out of {n_samples})")
+    plt.title(title)
+    plt.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+
+def pca_effective_rank(directions: np.ndarray, variance_thresholds: Tuple[float, ...] = (0.90, 0.95, 0.99)) -> dict:
+    """Estimates how many effectively ORTHOGONAL directions a set of
+    (generally non-orthogonal) direction vectors actually spans, via PCA.
+
+    Each active neuron's decoder column is a direction in gradient space,
+    but nothing in VAEase's objective forces distinct neurons' columns to
+    be orthogonal (unlike PCA eigenvectors), so "k active neurons" does
+    NOT necessarily mean "k independent directions" -- some could be
+    near-duplicates of each other. This gives a *soft*, graded answer to
+    "how many" (via the variance-explained spectrum), complementing
+    orthogonalize_directions()'s *hard* QR-based rank (which only drops
+    directions that are essentially EXACTLY linearly dependent -- this
+    catches directions that are merely highly correlated but not exactly
+    parallel, which QR's rank cutoff would still count separately).
+
+    IMPORTANT: this is deliberately UNCENTERED PCA -- eigendecomposition
+    of the raw (not mean-subtracted) second-moment matrix. Centering
+    (standard PCA on data points) would subtract out whatever "average
+    direction" these vectors share before decomposing, which is exactly
+    the wrong move here: we want the dimensionality of the SPAN of these
+    vectors from the origin (do they collectively point in few or many
+    distinct directions), not variance around some meaningful mean --
+    these are directions/concepts, not samples scattered around a center.
+
+    directions: (k, d), rows should already be unit-normalized (as
+    extract_decoder_directions' raw_directions already are).
+    Uses the same Gram-matrix trick as pca_analysis.py's own
+    find_significant_directions for the typical k <= d case (few active
+    neurons relative to gradient dimension): eigendecomposing the (k,k)
+    Gram matrix directions @ directions.T has the same nonzero eigenvalues
+    as the (d,d) second-moment matrix directions.T @ directions, just
+    cheaper when k << d.
+
+    Returns a dict with the full eigenvalue/explained-variance spectrum
+    plus how many components are needed to reach each of
+    `variance_thresholds` cumulative explained variance (default 90/95/99%).
+    """
+    directions = np.asarray(directions, dtype=np.float64)
+    k, d = directions.shape
+    if k == 0:
+        return {"k_input_directions": 0}
+
+    if k <= d:
+        gram = directions @ directions.T / k          # (k, k) -- cheaper, same nonzero eigenvalues
+        eigvals = np.linalg.eigvalsh(gram)[::-1]
+    else:
+        cov = directions.T @ directions / k            # (d, d)
+        eigvals = np.linalg.eigvalsh(cov)[::-1]
+    eigvals = np.clip(eigvals, 0, None)                # guard tiny negative numerical noise
+
+    total = eigvals.sum()
+    explained = eigvals / total if total > 0 else eigvals * 0
+    cumulative = np.cumsum(explained)
+
+    out = {
+        "k_input_directions": int(k),
+        "eigenvalues": eigvals.tolist(),
+        "explained_variance_ratio": explained.tolist(),
+        "cumulative_variance_ratio": cumulative.tolist(),
+    }
+    for t in variance_thresholds:
+        out[f"n_components_{int(round(t * 100))}pct"] = int(np.searchsorted(cumulative, t) + 1)
+    return out
+
+
+def plot_pca_scree(explained_variance_ratio: list, out_path: Path, title: str) -> None:
+    """Scree plot of pca_effective_rank's explained-variance spectrum,
+    same visual style as pca_analysis.py's own PCA scree plots."""
+    values = np.asarray(explained_variance_ratio) * 100
+    plt.figure(figsize=(8, 4))
+    plt.bar(range(len(values)), values)
+    plt.xlabel("Component")
+    plt.ylabel("Explained variance (%)")
+    plt.title(title)
+    plt.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150)
+    plt.close()
 
 
 def group_averaged_active_dims(sigma_z: np.ndarray, labels: Optional[np.ndarray] = None) -> dict:
@@ -765,6 +1102,19 @@ def train_vaease(
     n_train = len(x_train)
     t0 = time.time()
 
+    # Fixed-size "probe" subsample of the TRAINING set, same size as the
+    # val split, drawn once up front (not resampled per epoch). This lets
+    # every epoch's train-set AD mean/median be computed on an
+    # apples-to-apples footing with the val-set numbers (same N each time)
+    # without re-running count_active_dims's Python-level threshold search
+    # over the full training set every single epoch, which would scale
+    # with N and get slow for large datasets. If you'd rather have the
+    # exact full-training-set AD instead of a subsample estimate, say so
+    # and I'll swap this for the full x_train.
+    n_probe = min(len(x_train), n_val)
+    probe_idx = np.random.RandomState(seed).choice(len(x_train), size=n_probe, replace=False)
+    x_train_probe = x_train[probe_idx]
+
     for epoch in range(1, epochs + 1):
         model.train()
         perm = torch.randperm(n_train)
@@ -780,17 +1130,35 @@ def train_vaease(
         sched.step()
 
         mean_logs = {k: float(np.mean([l[k] for l in epoch_logs])) for k in epoch_logs[0]}
+
+        # --- AD mean/median on both val and a matched-size train probe,
+        # every epoch, so history.json has a full per-epoch curve for both.
+        sigma_val = encode_dataset(model, x_val, device=device)
+        ad_val = count_active_dims(sigma_val)
+        sigma_train_probe = encode_dataset(model, x_train_probe, device=device)
+        ad_train_probe = count_active_dims(sigma_train_probe)
+
+        mean_logs["val_ad_mean"] = float(ad_val.mean())
+        mean_logs["val_ad_median"] = float(np.median(ad_val))
+        mean_logs["val_ad_min"] = int(ad_val.min())
+        mean_logs["val_ad_max"] = int(ad_val.max())
+        mean_logs["val_ad_group"] = group_averaged_active_dims(sigma_val)["all"]["active_dims"]
+
+        mean_logs["train_ad_mean"] = float(ad_train_probe.mean())
+        mean_logs["train_ad_median"] = float(np.median(ad_train_probe))
+        mean_logs["train_ad_min"] = int(ad_train_probe.min())
+        mean_logs["train_ad_max"] = int(ad_train_probe.max())
+        mean_logs["train_ad_group"] = group_averaged_active_dims(sigma_train_probe)["all"]["active_dims"]
         history.append({"epoch": epoch, **mean_logs})
 
         if verbose and (epoch % report_every == 0 or epoch == 1 or epoch == epochs):
-            sigma_val = encode_dataset(model, x_val, device=device)
-            ad = count_active_dims(sigma_val)
             elapsed = time.time() - t0
             print(f"[epoch {epoch:>4}/{epochs}] loss={mean_logs['loss']:.4f}  "
                   f"recon_mse/dim={mean_logs['recon_mse_per_dim']:.4f}  "
                   f"KL={mean_logs['kl']:.4f}  gamma={mean_logs['gamma']:.4g}  "
-                  f"val AD: mean={ad.mean():.1f} median={np.median(ad):.0f} "
-                  f"[{ad.min()}-{ad.max()}]  ({elapsed:.0f}s elapsed)")
+                  f"train AD: mean={mean_logs['train_ad_mean']:.1f} median={mean_logs['train_ad_median']:.0f}  "
+                  f"val AD: mean={mean_logs['val_ad_mean']:.1f} median={mean_logs['val_ad_median']:.0f}  "
+                  f"({elapsed:.0f}s elapsed)")
 
     torch.save({
         "model_state": model.state_dict(),
@@ -798,10 +1166,12 @@ def train_vaease(
         "norm": norm,
     }, out_dir / "vaease_checkpoint.pt")
     (out_dir / "history.json").write_text(json.dumps(history, indent=2))
+    plot_training_history(history, out_dir / "history_plots.png")
 
     if verbose:
         print(f"\nSaved checkpoint -> {out_dir / 'vaease_checkpoint.pt'}")
         print(f"Saved training history -> {out_dir / 'history.json'}")
+        print(f"Saved history plots -> {out_dir / 'history_plots.png'}")
         if normalizer is not None:
             print(f"Saved normalizer -> {out_dir / 'normalizer.npz'}")
 
@@ -813,6 +1183,107 @@ def train_vaease(
     ad_all = count_active_dims(sigma_all)
     grouped_all = group_averaged_active_dims(sigma_all)["all"]
 
+    # --- NEW: per-neuron activation frequency (how many of the N samples
+    # activate each of the kappa neurons), and a histogram of that
+    # distribution across neurons. Complements ad_all above: ad_all counts,
+    # per SAMPLE, how many neurons fire; this counts, per NEURON, how many
+    # samples it fires on -- the standard sparse-autoencoder "feature
+    # activation frequency" diagnostic. Reuses sigma_all, already computed
+    # just above, so this adds no extra encoder passes.
+    neuron_activation_counts = compute_neuron_activation_counts(sigma_all)
+    neuron_hist = plot_neuron_activation_histogram(
+        neuron_activation_counts, n_samples=N,
+        out_path=out_dir / "neuron_activation_histogram.png",
+        title="Neuron activation frequency \u2014 full dataset",
+    )
+    (out_dir / "neuron_activation_histogram.json").write_text(json.dumps(neuron_hist, indent=2))
+    if verbose:
+        print(f"\nNeuron activation frequency (kappa={neuron_hist['kappa']} neurons, N={N} samples):")
+        print(f"  Never active:          {neuron_hist['n_never_active']} neurons")
+        print(f"  Always active:         {neuron_hist['n_always_active']} neurons")
+        print(f"  Mean activation count: {neuron_hist['mean_activation_count']:.1f} / {N}")
+        print(f"  Top 10 most active neurons (index: count): "
+              + ", ".join(f"{idx}:{cnt}" for idx, cnt in neuron_hist["top_10_active_neurons"]))
+        print(f"  Saved -> {out_dir / 'neuron_activation_histogram.png'} (+ .json)")
+
+    plot_neuron_activation_bar(
+        neuron_activation_counts, n_samples=N,
+        out_path=out_dir / "neuron_activation_bar.png",
+        title=f"Per-neuron activation count \u2014 full dataset (kappa={kappa})",
+    )
+    if verbose:
+        print(f"  Saved -> {out_dir / 'neuron_activation_bar.png'} "
+              f"(one bar per neuron, {kappa} bars)")
+
+    # --- NEW: estimate how many effectively ORTHOGONAL directions the
+    # active neurons' decoder columns actually span, via PCA. Each active
+    # neuron's decoder column is a direction, but nothing forces distinct
+    # neurons' columns to be orthogonal, so "k active neurons" != "k
+    # independent directions" in general. Done for BOTH neuron-selection
+    # criteria, since they're different selections and can disagree:
+    #   - "group_averaged": grouped_all's active set (same selection
+    #     extract_decoder_directions uses -- average sigma^2 across
+    #     samples first, threshold once)
+    #   - "active_over_5pct_samples": neurons active on >5% of samples
+    #     individually (from neuron_activation_counts, just computed above)
+    # Only meaningful for linear_decoder=True (see extract_decoder_
+    # directions' own docstring for why an MLP decoder has no single
+    # global direction per neuron) -- skipped gracefully otherwise.
+    if model.linear_decoder:
+        W_dec_all = model.decoder.weight.detach().cpu().numpy()   # (d, kappa)
+        freq_active_indices = np.where(neuron_activation_counts > 0.05 * N)[0]
+
+        orth_results = {}
+        for sel_name, indices in [
+            ("group_averaged", np.array(grouped_all["active_dim_indices"], dtype=int)),
+            ("active_over_5pct_samples", freq_active_indices),
+        ]:
+            if len(indices) == 0:
+                orth_results[sel_name] = {"k_input_directions": 0, "note": "no active neurons found"}
+                continue
+            cols = W_dec_all[:, indices].T                          # (k, d)
+            col_norms = np.linalg.norm(cols, axis=1, keepdims=True)
+            col_norms = np.where(col_norms < 1e-12, 1.0, col_norms)
+            unit_dirs = cols / col_norms
+            res = pca_effective_rank(unit_dirs)
+            res["active_indices"] = indices.tolist()
+            orth_results[sel_name] = res
+            plot_pca_scree(
+                res["explained_variance_ratio"],
+                out_dir / f"orthogonal_directions_pca_{sel_name}.png",
+                title=f"PCA of active-neuron decoder directions\n"
+                      f"({sel_name}, k={len(indices)} active neurons)",
+            )
+
+        (out_dir / "orthogonal_directions_pca.json").write_text(json.dumps(orth_results, indent=2))
+        if verbose:
+            print(f"\nEstimated orthogonal-direction count (PCA on active-neuron decoder columns):")
+            for sel_name, res in orth_results.items():
+                if res.get("k_input_directions", 0) == 0:
+                    print(f"  {sel_name}: no active neurons found")
+                    continue
+                print(f"  {sel_name} (k={res['k_input_directions']} active neurons): "
+                      f"components needed for 90%={res['n_components_90pct']}  "
+                      f"95%={res['n_components_95pct']}  99%={res['n_components_99pct']}")
+            print(f"  Saved -> {out_dir / 'orthogonal_directions_pca.json'} "
+                  f"(+ scree plot per selection)")
+    elif verbose:
+        print("\n(Skipping orthogonal-direction PCA estimate: requires linear_decoder=True)")
+
+    # --- histogram of per-sample active-dimension counts on the held-out
+    # val/test split specifically (x_val), as distinct from the full-
+    # dataset numbers above. This is the generalization-focused view: it
+    # answers "for gradients the model didn't train on, what does the
+    # distribution of local dimensionality actually look like" rather
+    # than a single aggregate number.
+    sigma_val_final = encode_dataset(model, x_val, device=device)
+    ad_val_final = count_active_dims(sigma_val_final)
+    val_hist = plot_active_dims_histogram(
+        ad_val_final, out_dir / "active_dims_histogram_valset.png",
+        title=f"Active dimensions per sample \u2014 held-out val/test set",
+    )
+    (out_dir / "active_dims_histogram_valset.json").write_text(json.dumps(val_hist, indent=2))
+
     summary = {
         "n_samples": int(N),
         "kappa": int(kappa),
@@ -823,6 +1294,7 @@ def train_vaease(
         "per_sample_max": int(ad_all.max()),
         "group_averaged_active_dims": grouped_all["active_dims"],
         "group_averaged_dim_indices": grouped_all["active_dim_indices"],
+        "val_set": val_hist,
     }
     (out_dir / "active_dims_summary.json").write_text(json.dumps(summary, indent=2))
 
@@ -833,7 +1305,12 @@ def train_vaease(
               f"[{summary['per_sample_min']}-{summary['per_sample_max']}]")
         print(f"  Group-averaged AD:    {summary['group_averaged_active_dims']}  "
               f"(one number for the whole dataset, matches paper's Table 2/3 protocol)")
+        print(f"  Held-out val/test set (n={val_hist['n_samples']}): "
+              f"mean={val_hist['mean']:.2f} median={val_hist['median']:.0f} "
+              f"[{val_hist['min']}-{val_hist['max']}]")
         print(f"  Saved -> {out_dir / 'active_dims_summary.json'}")
+        print(f"  Saved -> {out_dir / 'active_dims_histogram_valset.png'} "
+              f"(+ .json with raw bin counts)")
 
     return model
 
@@ -952,7 +1429,7 @@ if __name__ == "__main__":
                              "(loses direct interpretability of active dims "
                              "as a linear direction dictionary — direction "
                              "extraction/interventions below will refuse to run).")
-    parser.add_argument("--epochs", type=int, default=600)
+    parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--val_fraction", type=float, default=0.05)
