@@ -1,0 +1,33 @@
+{
+  "n_samples": 195000,
+  "kappa": 64,
+  "per_sample_mean": 2.2515846153846155,
+  "per_sample_median": 2.0,
+  "per_sample_std": 1.3074785096117822,
+  "per_sample_min": 1,
+  "per_sample_max": 5,
+  "group_averaged_active_dims": 1,
+  "group_averaged_dim_indices": [
+    47
+  ],
+  "val_set": {
+    "bins": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "counts": [
+      4610,
+      875,
+      1506,
+      2759
+    ],
+    "n_samples": 9750,
+    "mean": 2.2475897435897436,
+    "median": 2.0,
+    "std": 1.3030267863895402,
+    "min": 1,
+    "max": 4
+  }
+}

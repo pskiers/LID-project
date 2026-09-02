@@ -27,7 +27,7 @@ class ConfigMLP:
     # LayerNorm → Linear(10→128) → SiLU → Linear(128→128) → SiLU → Linear(128→128)
     # output: (B, 1, 128) — single token for cross-attention
     # ------------------------------------------------------------------ #
-    cond_input_dim: int = 10                  # 3 one-hot + 7 scalars
+    cond_input_dim: int = 9               # 3 one-hot + 7 scalars
     cond_hidden_dim: int = 64
     cond_output_dim: int = 64                 # must equal cross_attention_dim
 

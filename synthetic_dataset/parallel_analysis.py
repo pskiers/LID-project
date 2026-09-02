@@ -37,7 +37,16 @@ import matplotlib.pyplot as plt
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--grads",          type=str, nargs="+", required=True,
-                        help="One or more grads_tXXX.npy files to analyse")
+                        help="One or more grads_tXXX.npy files to analyse, OR a single "
+                             "directory containing them -- ALL files matching "
+                             "--glob_pattern in that directory are used, and (unlike "
+                             "passing explicit files) are COMBINED into one dataset for "
+                             "a single Parallel Analysis, not analysed individually.")
+    parser.add_argument("--glob_pattern",   type=str, default="*.npy",
+                        help="Glob pattern used when --grads is a single directory. "
+                             "Default '*.npy' takes every .npy file in it. Narrow this "
+                             "(e.g. 'grads_t*.npy') if the directory also contains "
+                             "unrelated .npy files you want to exclude.")
     parser.add_argument("--out_dir",        type=str, default="outputs/parralel_analysis/",
                         help="Where to save plots and results. Defaults to same dir as first grads file.")
     parser.add_argument("--n_simulations",  type=int, default=100,
@@ -45,7 +54,7 @@ def parse_args():
     parser.add_argument("--percentile",     type=float, default=95,
                         help="Percentile of noise distribution to use as threshold (default: 95)")
     parser.add_argument("--seed",           type=int, default=42)
-    parser.add_argument("--normalize_grads", action="store_true", default=True,
+    parser.add_argument("--normalize_grads", action="store_true", default=False,
                         help="L2-normalize each gradient to unit length before PCA.")
     return parser.parse_args()
 
@@ -53,6 +62,37 @@ def parse_args():
 # ---------------------------------------------------------------------------
 # PCA (eigenvalue decomposition on covariance matrix)
 # ---------------------------------------------------------------------------
+
+def expand_grad_paths(grads: list, glob_pattern: str) -> tuple:
+    """If `grads` is a single directory, expands it to every file matching
+    `glob_pattern` inside it, sorted numerically by any digits in the
+    filename (grads_t500 sorts after grads_t50, not alphabetically before
+    it); files with no digits at all sort after all numbered ones,
+    alphabetically among themselves. Otherwise returns the explicit list
+    of paths as-is.
+
+    Returns (expanded_paths, combine_all): combine_all is True only when
+    a directory was given -- signaling that these files should be
+    CONCATENATED into one combined dataset and analysed as a single
+    Parallel Analysis, not individually. An explicit file list (however
+    many files) always gets combine_all=False and keeps the existing
+    per-file behavior, unchanged.
+    """
+    if len(grads) == 1 and Path(grads[0]).is_dir():
+        grads_dir = Path(grads[0])
+        def sort_key(p):
+            digits = ''.join(filter(str.isdigit, p.stem))
+            return (int(digits), p.stem) if digits else (float("inf"), p.stem)
+        found = sorted(grads_dir.glob(glob_pattern), key=sort_key)
+        if not found:
+            raise FileNotFoundError(f"No files matching '{glob_pattern}' found in {grads_dir}")
+        print(f"Expanded directory {grads_dir} -> {len(found)} files "
+              f"(will be COMBINED into one dataset, not analysed individually):")
+        for p in found:
+            print(f"  {p}")
+        return [str(p) for p in found], True
+    return grads, False
+
 
 def pca_eigenvalues(data: np.ndarray) -> np.ndarray:
     """
@@ -203,6 +243,7 @@ def plot_parallel_analysis(result: dict, label: str, out_path: Path, percentile:
 
 def main():
     args = parse_args()
+    args.grads, combine_all = expand_grad_paths(args.grads, args.glob_pattern)
 
     out_dir = Path(args.out_dir) if args.out_dir else Path(args.grads[0]).parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -219,40 +260,41 @@ def main():
             g = g / (norms + 1e-8)
         all_grads[grads_path.stem] = g
 
-    shapes = {label: g.shape for label, g in all_grads.items()}
-    N_vals = set(s[0] for s in shapes.values())
-    D_vals = set(s[1] for s in shapes.values())
-
-    if len(N_vals) > 1 or len(D_vals) > 1:
-        print("WARNING: grads files have different shapes — cannot use a shared noise threshold.")
-        print("  Shapes:", shapes)
-        print("  Falling back to per-file thresholds.\n")
-        shared_threshold = False
-    else:
-        N, D = next(iter(shapes.values()))
-        shared_threshold = True
-        print(f"All grads files share shape ({N}, {D}) — computing shared noise threshold.")
-
-    # ------------------------------------------------------------------
-    # Compute noise threshold (once if shared, per-file otherwise)
-    # ------------------------------------------------------------------
-    if shared_threshold:
-        ref_grads = next(iter(all_grads.values()))
-        scale = float(ref_grads.std())
-        print(f"\nRunning {args.n_simulations} scaled Gaussian noise simulations "
-              f"(N={N}, D={D}, scale={scale:.6f}, percentile={args.percentile}) ...")
-        rng = np.random.RandomState(args.seed)
-        simulated_eigvals = np.zeros((args.n_simulations, D), dtype=np.float32)
-        for i in range(args.n_simulations):
-            noise_data = (rng.randn(N, D) * scale).astype(np.float32)
-            simulated_eigvals[i, :] = pca_eigenvalues(noise_data)
-            if (i + 1) % 20 == 0:
-                print(f"  [{i+1}/{args.n_simulations}]")
-        shared_thresholds = np.percentile(simulated_eigvals, args.percentile, axis=0)
-        print(f"  Shared threshold computed (scale={scale:.6f}).")
+    if combine_all:
+        # A directory was given -- concatenate every loaded file's pairs
+        # into ONE combined dataset (matching pca_analysis.py's own
+        # "shared gradient space" concept) and analyse THAT single
+        # dataset, rather than each file individually. Normalization (if
+        # requested) has already been applied per-file above, before
+        # concatenation -- exactly as pca_analysis.py does it for its own
+        # shared-space PCA.
+        D_vals_pre = {g.shape[1] for g in all_grads.values()}
+        if len(D_vals_pre) > 1:
+            dims = {label: g.shape[1] for label, g in all_grads.items()}
+            raise SystemExit(
+                f"--grads directory contains files with mismatched dimensionality, "
+                f"can't be combined into one dataset: {dims}. Combine only works "
+                f"across files that share the same D (e.g. all from the same "
+                f"--cond_input_dim run)."
+            )
+        combined = np.concatenate(list(all_grads.values()), axis=0)
+        print(f"\nCombining {len(all_grads)} files into ONE dataset for Parallel "
+              f"Analysis: total shape {combined.shape} "
+              f"({sum(g.shape[0] for g in all_grads.values())} pairs pooled from "
+              f"{len(all_grads)} files, {combined.shape[1]} dims)")
+        all_grads = {"combined": combined}
 
     # ------------------------------------------------------------------
-    # Run parallel analysis per file using shared (or per-file) threshold
+    # Run proper (column-permutation) Parallel Analysis per entry in
+    # all_grads. Each entry gets its OWN independent permutation
+    # simulation -- unlike the old scaled-Gaussian-noise approach, a
+    # permutation simulation is built from that entry's OWN actual data
+    # values, so there's no meaningful way to "share" one entry's
+    # simulation with another's (even if they happen to share N and D).
+    # When --grads was a directory, all_grads has exactly ONE entry here
+    # ("combined") -- the concatenated data from every file in it,
+    # already treated as a single unified dataset by this point, not
+    # analysed as separate files.
     # ------------------------------------------------------------------
     all_results = {}
 
@@ -262,41 +304,10 @@ def main():
         print(f"Parallel Analysis: {label}  |  shape: ({N}, {D})")
         print(f"{'='*60}")
 
-        print(f"  Running PCA on real data ...")
-        real_eigvals = pca_eigenvalues(grads)
-        total_var    = real_eigvals.sum()
-        real_var_ratios = real_eigvals / total_var
-
-        if shared_threshold:
-            thresholds           = shared_thresholds
-            threshold_var_ratios = thresholds / total_var
-            sim_eigvals          = simulated_eigvals   # reuse for plotting
-        else:
-            # per-file fallback (different N or D across files)
-            scale = float(grads.std())
-            rng = np.random.RandomState(args.seed)
-            sim_eigvals = np.zeros((args.n_simulations, D), dtype=np.float32)
-            for i in range(args.n_simulations):
-                noise_data = (rng.randn(N, D) * scale).astype(np.float32)
-                sim_eigvals[i, :] = pca_eigenvalues(noise_data)
-            thresholds           = np.percentile(sim_eigvals, args.percentile, axis=0)
-            threshold_var_ratios = thresholds / total_var
-
-        significant_mask = real_eigvals > thresholds
-        n_significant    = int(significant_mask.argmin()) if not significant_mask.all() else D
-        if significant_mask[0] and n_significant == 0:
-            n_significant = D
-
-        result = {
-            "real_eigenvalues":      real_eigvals,
-            "thresholds":            thresholds,
-            "real_var_ratios":       real_var_ratios,
-            "threshold_var_ratios":  threshold_var_ratios,
-            "significant_mask":      significant_mask,
-            "n_significant":         n_significant,
-            "simulated_eigenvalues": sim_eigvals,
-            "total_var":             total_var,
-        }
+        result = parallel_analysis(
+            grads, n_simulations=args.n_simulations,
+            percentile=args.percentile, seed=args.seed,
+        )
         all_results[label] = result
 
         n_sig = result["n_significant"]
@@ -312,7 +323,7 @@ def main():
 
         txt  = f"Parallel Analysis: {label}\n"
         txt += f"N={N}, D={D}, n_simulations={args.n_simulations}, percentile={args.percentile}"
-        txt += f", shared_threshold={shared_threshold}\n"
+        txt += f", method=column_permutation\n"
         txt += f"Significant directions: {n_sig}\n\n"
         txt += f"{'Component':>10}  {'Real var%':>10}  {'Threshold%':>10}  {'Significant':>12}\n"
         for k in range(D):

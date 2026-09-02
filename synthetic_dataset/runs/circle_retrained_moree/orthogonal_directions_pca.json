@@ -1,0 +1,58 @@
+{
+  "group_averaged": {
+    "k_input_directions": 1,
+    "eigenvalues": [
+      1.0000000459488128
+    ],
+    "explained_variance_ratio": [
+      1.0
+    ],
+    "cumulative_variance_ratio": [
+      1.0
+    ],
+    "n_components_90pct": 1,
+    "n_components_95pct": 1,
+    "n_components_99pct": 1,
+    "active_indices": [
+      47
+    ]
+  },
+  "active_over_5pct_samples": {
+    "k_input_directions": 6,
+    "eigenvalues": [
+      0.3819256579064704,
+      0.29428439855545935,
+      0.16565255959431716,
+      0.15608134541204144,
+      0.0016059949741686487,
+      0.0004500908077466306
+    ],
+    "explained_variance_ratio": [
+      0.38192563986040606,
+      0.2942843846504622,
+      0.16565255176720034,
+      0.15608133803716642,
+      0.0016059948982850626,
+      0.0004500907864797492
+    ],
+    "cumulative_variance_ratio": [
+      0.38192563986040606,
+      0.6762100245108682,
+      0.8418625762780685,
+      0.9979439143152349,
+      0.9995499092135199,
+      0.9999999999999997
+    ],
+    "n_components_90pct": 4,
+    "n_components_95pct": 4,
+    "n_components_99pct": 4,
+    "active_indices": [
+      20,
+      35,
+      45,
+      47,
+      52,
+      53
+    ]
+  }
+}

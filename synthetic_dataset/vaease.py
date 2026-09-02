@@ -1429,11 +1429,11 @@ if __name__ == "__main__":
                              "(loses direct interpretability of active dims "
                              "as a linear direction dictionary — direction "
                              "extraction/interventions below will refuse to run).")
-    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--epochs", type=int, default=6000)
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--val_fraction", type=float, default=0.05)
-    parser.add_argument("--norm", type=str, default="l2",
+    parser.add_argument("--norm", type=str, default="none",
                         choices=["standardize", "l2", "l2_then_standardize", "none"],
                         help="'standardize' (default): per-coordinate zero-mean/unit-"
                              "variance, keeps VAEase's single global gamma honest across "

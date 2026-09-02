@@ -45,7 +45,7 @@ from models.conditioner import ShapeConditioningEncoder
 # columns dropped entirely, and any other N follows the same prefix rule if
 # your dataset variant matches this ordering convention.
 FEATURE_NAMES_FULL = ["is_tri", "is_sq", "is_circ", "r", "g", "b", "size",
-                       "h_stripe", "v_stripe", "grain"]
+                       "x_pos", "y_pos", "grain"]
 N_SHAPE_DIMS = 3   # is_tri, is_sq, is_circ — always the first 3, one-hot
 
 # Default value for each continuous feature, used only when --prompt is
@@ -54,7 +54,7 @@ N_SHAPE_DIMS = 3   # is_tri, is_sq, is_circ — always the first 3, one-hot
 # defaults, which use 1.0 / 0.5; each script keeps its own convention).
 CONTINUOUS_DEFAULTS = {
     "r": 0.5, "g": 0.5, "b": 0.5, "size": 0.5,
-    "h_stripe": 0.0, "v_stripe": 0.0, "grain": 0.0,
+    "x_pos": 0.5, "y_pos": 0.5, "grain": 0.5,
 }
 
 
@@ -84,13 +84,13 @@ def default_prompt_for(cond_input_dim: int) -> list:
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default="/net/scratch/hscra/plgrid/plgekaczmarczyk/LID-project/synthetic_dataset/outputs/checkpoints/outputs_64_acc_mixed_dz0.3/checkpoint-epoch-0200/")
+    parser.add_argument("--checkpoint", type=str, default="/net/scratch/hscra/plgrid/plgekaczmarczyk/LID-project/synthetic_dataset/outputs/checkpoints/outputs_64_acc_mixed_dz0.1_pos1/checkpoint-epoch-0200/")
     parser.add_argument("--num_steps",  type=int, default=10)
     parser.add_argument("--n",          type=int, default=5000,
                         help="Number of images to generate")
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--out_dir",    type=str, default="outputs/samples_for_grads/square_mixed")
-    parser.add_argument("--cond_input_dim", type=int, default=10,
+    parser.add_argument("--out_dir",    type=str, default="outputs/samples_for_grads/circle_mixed_dz0.1_pos1_nopos/")
+    parser.add_argument("--cond_input_dim", type=int, default=9,
                         help="Conditioner input dimensionality. Default 10 matches the "
                              "original shape+rgb+size+stripe+grain dataset. Set to 7 for "
                              "the no-texture variant (shape+rgb+size, stripe/grain columns "

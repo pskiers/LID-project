@@ -90,7 +90,7 @@ from dataset_64_update import SampleVector64, ImageGenerator64
 # the no-texture variant), and any other N follows the same prefix rule if
 # your dataset variant matches this ordering convention.
 FEATURE_NAMES_FULL = ["is_tri", "is_sq", "is_circ", "r", "g", "b", "size",
-                       "h_stripe", "v_stripe", "grain"]
+                       "x_pos", "y_pos", "grain"]
 N_SHAPE_DIMS = 3   # is_tri, is_sq, is_circ — always the first 3, one-hot
 
 # Default value for each continuous feature, used only when --prompt is
@@ -98,7 +98,7 @@ N_SHAPE_DIMS = 3   # is_tri, is_sq, is_circ — always the first 3, one-hot
 # --cond_input_dim is in effect.
 CONTINUOUS_DEFAULTS = {
     "r": 1.0, "g": 1.0, "b": 1.0, "size": 1.0,
-    "h_stripe": 0.5, "v_stripe": 0.5, "grain": 0.5,
+    "x_pos": 0.5, "y_pos": 0.5, "grain": 0.5,
 }
 
 
@@ -132,10 +132,10 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default="/net/scratch/hscra/plgrid/plgekaczmarczyk/LID-project/synthetic_dataset/outputs/checkpoints/outputs_64_acc_random/checkpoint-epoch-0200/")
     parser.add_argument("--data_dir",   type=str, default="outputs/samples_for_grads/circle",
                         help="Folder with 000000.png ... and vectors.npy")
-    parser.add_argument("--out_dir",    type=str, default="outputs/gradients/t_mult_circle")
-    parser.add_argument("--n_pairs",    type=int, default=5000,
+    parser.add_argument("--out_dir",    type=str, default="outputs/gradients/t_mult_circle_10k")
+    parser.add_argument("--n_pairs",    type=int, default=10000,
                         help="Number of pairs to compute gradients for")
-    parser.add_argument("--timesteps",  type=int, nargs="+", default=[999,900,800,700,600,50],
+    parser.add_argument("--timesteps",  type=int, nargs="+", default=[950,900,850,800,750, 700, 650,600,550,500,450, 400, 350, 300, 250, 200,150, 100,50],
                         help="Noise timestep(s) to run, e.g. --timesteps 500 or --timesteps 100 300 500 700")
     parser.add_argument("--cond_input_dim", type=int, default=10,
                         help="Conditioner input dimensionality. Default 10 matches the "
