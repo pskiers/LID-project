@@ -72,7 +72,7 @@ def parse_args():
                              "Default '*.npy' takes every .npy file in it. Narrow this "
                              "(e.g. 'grads_t*.npy') if the directory also contains "
                              "unrelated .npy files you want to exclude.")
-    parser.add_argument("--out_dir",            type=str, default="outputs/interventions/t_mult_square_mixed_dz0.1_pos")
+    parser.add_argument("--out_dir",            type=str, default="outputs/interventions/t_mult_triangle_mixed_dz0.1_pos1")
     parser.add_argument("--num_steps",          type=int, default=10)
     parser.add_argument("--n_directions",       type=int, default=64,
                         help="Number of top PCA directions to visualize")
@@ -107,7 +107,14 @@ def parse_args():
                              "this if your conditioner used some other, non-prefix subset.")
     parser.add_argument("--seed",               type=int, default=42)
     parser.add_argument("--no_interventions",   action="store_true", default=False,
-                        help="Skip intervention grid generation (dot products and cross-space analysis only)")
+                        help="Skip intervention grid generation (dot products only)")
+    parser.add_argument("--cross_space_analysis", action="store_true", default=False,
+                        help="Also compute pairwise dot products BETWEEN different grads "
+                             "files' own PCA directions (e.g. does timestep 500's gradient "
+                             "space overlap with timestep 300's) -- only relevant when "
+                             "multiple --grads files are given. Off by default: this is a "
+                             "separate, optional comparison from the per-file dot-product "
+                             "tables against the chosen subspace, not needed for those.")
     parser.add_argument("--normalize_grads",    action="store_true", default=True,
                         help="L2-normalize each gradient to unit length before PCA. "
                              "Removes magnitude weighting so all pairs contribute equally "
@@ -143,46 +150,80 @@ def resolve_feature_names(cond_input_dim: int, override: list = None) -> list:
 
 
 def build_valid_subspace_basis(conditioner, base_prompt: list, feature_names: list,
-                                cond_input_dim: int, device) -> np.ndarray:
-    """The 'chosen subspace' basis, as a (64, n_continuous) matrix aligned
-    with feature_names[N_SHAPE_DIMS:]: column i is the direction in
-    cond_out space from an ALL-ZERO-CONTINUOUS baseline (same shape
-    one-hot as base_prompt, every continuous feature at 0.0) to that
-    same baseline with feature_names[N_SHAPE_DIMS+i] maxed to 1.0 -- e.g.
-    for a circle (shape one-hot from base_prompt) and cond_input_dim=7:
-    conditioner([0,0,1, 1,0,0,0]) - conditioner([0,0,1, 0,0,0,0]) for the
-    'r' column, matching a genuinely valid circle conditioning vector on
-    both ends (never conditioner(e_i), an input like shape=[0,0,0] that
-    no real image was ever conditioned on). Shape is taken from
-    base_prompt and held FIXED throughout -- only the continuous features
-    are swept, one at a time -- so this reflects "the chosen subspace of
-    the whole space" for whichever shape base_prompt specifies (e.g. its
-    own --base_prompt for circles, or a black-square base_prompt for
-    squares), not an arbitrary orthogonalization of the raw (and
-    partly-invalid) conditioner.proj.weight columns.
+                                cond_input_dim: int, device, subtract_baseline: bool = True) -> tuple:
+    """The 'chosen subspace' basis, as a (64, n_active) matrix: column i is
+    the direction in cond_out space from a baseline (same shape one-hot as
+    base_prompt, every FIXED continuous dim held at its base_prompt value,
+    every ACTIVE continuous dim at 0.0) to that same baseline with one
+    active dim maxed to 1.0 -- e.g. for a circle and cond_input_dim=7 with
+    every continuous dim active: conditioner([0,0,1, 1,0,0,0]) -
+    conditioner([0,0,1, 0,0,0,0]) for the 'r' column, matching a genuinely
+    valid circle conditioning vector on both ends (never conditioner(e_i),
+    an input like shape=[0,0,0] that no real image was ever conditioned
+    on).
 
-    Unlike the old QR-orthogonalized approach, these columns are NOT
-    necessarily mutually orthogonal (no rank-deficiency correction
-    needed either, since shape itself is never swept as a direction here
-    -- there's no one-hot-sum-to-1 constraint among these columns to
-    begin with) -- each one is independently a meaningful, valid movement
-    in conditioning space, and that's what's being projected onto.
+    A continuous dim counts as ACTIVE only if base_prompt marks it 0.5 --
+    the same "randomize this dim" sentinel this script already uses
+    elsewhere for intervention base vectors -- and only active dims get
+    swept as basis directions. Any dim base_prompt fixes at some other
+    value (e.g. a triangle base_prompt with position fixed at 0,0) is held
+    at exactly that value in BOTH the baseline and every probe, and never
+    becomes a basis column: e.g. for a triangle with position fixed and
+    color+size active, this returns a 4-column basis (r,g,b,size), not 6.
+    Shape itself is never swept either way -- taken from base_prompt and
+    held fixed throughout.
+
+    subtract_baseline=True (default): column i = conditioner(probe_i) -
+    conditioner(baseline) -- isolates just the marginal effect of that one
+    feature changing, removing whatever shape/bias/all-else-zero
+    contribution every probe shares in common regardless of which feature
+    it's for.
+    subtract_baseline=False: column i = conditioner(probe_i) directly, no
+    subtraction. These columns share a large common component across
+    every feature (the baseline's own contribution never gets removed),
+    so cosine similarity BETWEEN DIFFERENT FEATURES' columns runs much
+    higher than in the subtracted version, even for features that are
+    semantically unrelated -- the resulting dot-product tables turned out
+    not to be a useful diagnostic in practice, which is why main() no
+    longer calls this with False; the parameter is kept for anyone who
+    wants to inspect this mode directly.
+
+    Returns (basis, active_names): basis is (64, n_active); active_names
+    is the list of feature names the columns are in order of (a strict
+    subset of feature_names[N_SHAPE_DIMS:cond_input_dim] whenever some
+    dims are fixed).
+
+    These columns are NOT necessarily mutually orthogonal (no rank-
+    deficiency correction needed either, since shape itself is never swept
+    as a direction here -- there's no one-hot-sum-to-1 constraint among
+    these columns to begin with) -- each one is independently a
+    meaningful, valid movement in conditioning space. See main() for the
+    separate QR-orthogonalized version built from these same columns.
     """
     shape_one_hot = list(base_prompt[:N_SHAPE_DIMS])
-    continuous_names = feature_names[N_SHAPE_DIMS:cond_input_dim]
-    n_continuous = len(continuous_names)
+    continuous_prompt = list(base_prompt[N_SHAPE_DIMS:cond_input_dim])
+    continuous_names_all = feature_names[N_SHAPE_DIMS:cond_input_dim]
 
-    baseline_vec = torch.tensor(shape_one_hot + [0.0] * n_continuous, dtype=torch.float32)
+    active_indices = [i for i, v in enumerate(continuous_prompt) if v == 0.5]
+    active_names = [continuous_names_all[i] for i in active_indices]
+
+    # baseline: shape fixed, every FIXED continuous dim at its own
+    # base_prompt value, every ACTIVE dim at 0.0 (the sweep's own zero point)
+    baseline_continuous = list(continuous_prompt)
+    for i in active_indices:
+        baseline_continuous[i] = 0.0
+    baseline_vec = torch.tensor(shape_one_hot + baseline_continuous, dtype=torch.float32)
+
     with torch.no_grad():
         baseline_out = conditioner(baseline_vec.unsqueeze(0).to(device)).squeeze().cpu().numpy()
         cols = []
-        for i in range(n_continuous):
-            probe_list = shape_one_hot + [0.0] * n_continuous
-            probe_list[N_SHAPE_DIMS + i] = 1.0
-            probe_vec = torch.tensor(probe_list, dtype=torch.float32)
+        for i in active_indices:
+            probe_continuous = list(baseline_continuous)
+            probe_continuous[i] = 1.0
+            probe_vec = torch.tensor(shape_one_hot + probe_continuous, dtype=torch.float32)
             probe_out = conditioner(probe_vec.unsqueeze(0).to(device)).squeeze().cpu().numpy()
-            cols.append(probe_out - baseline_out)
-    return np.stack(cols, axis=1)   # (64, n_continuous)
+            cols.append(probe_out - baseline_out if subtract_baseline else probe_out)
+    return np.stack(cols, axis=1), active_names   # (64, n_active), names
 
 
 def expand_grad_paths(grads: list, glob_pattern: str) -> list:
@@ -417,57 +458,45 @@ def main():
         print(f"  Saved scree plot → {out_dir / f'scree_{label}.png'}")
 
     # ------------------------------------------------------------------
-    # Dot products between gradient directions and conditioner weight columns
+    # Dot products between gradient directions and the chosen subspace
     # ------------------------------------------------------------------
     print(f"\n--- Dot products: gradient dirs vs conditioner input features ---")
-    W = conditioner.proj.weight.detach().cpu()   # (64, cond_input_dim)
-    W_normalized = F.normalize(W, dim=0)   # normalize each column (feature direction)
 
     # The "chosen subspace" basis: valid conditioning-vector differences
     # for whichever shape --base_prompt specifies (e.g. circle by
-    # default), NOT an orthogonalization of the raw (partly-invalid)
-    # weight columns above -- see build_valid_subspace_basis's own
-    # docstring for why. Built once, reused for every grads file below.
-    subspace_names = feature_names[N_SHAPE_DIMS:args.cond_input_dim]
-    subspace_basis = torch.from_numpy(
-        build_valid_subspace_basis(
-            conditioner, args.base_prompt, feature_names, args.cond_input_dim, device
-        ).astype(np.float32)
-    )   # (64, n_continuous)
+    # default), restricted to only the continuous dims base_prompt marks
+    # active (0.5) -- see build_valid_subspace_basis's own docstring.
+    # Built once, reused for every grads file below.
+    subspace_basis_raw, subspace_names = build_valid_subspace_basis(
+        conditioner, args.base_prompt, feature_names, args.cond_input_dim, device,
+        subtract_baseline=True,
+    )
+    subspace_basis = torch.from_numpy(subspace_basis_raw.astype(np.float32))   # (64, n_active)
     subspace_basis_normalized = F.normalize(subspace_basis, dim=0)
     print(f"  Chosen subspace basis built for shape one-hot {args.base_prompt[:N_SHAPE_DIMS]} "
-          f"({len(subspace_names)} continuous dims: {subspace_names})")
+          f"({len(subspace_names)} active continuous dims: {subspace_names})")
+
+    # These columns are NOT mutually orthogonal in general (see
+    # build_valid_subspace_basis's docstring -- passing standard basis
+    # inputs through a nonlinear conditioner doesn't preserve their
+    # orthogonality). QR gives a genuinely orthonormal basis spanning the
+    # SAME subspace these (valid-input-derived) columns span -- unlike the
+    # old QR approach, this orthogonalizes valid conditioning-vector
+    # directions, not the raw (partly-invalid) weight columns. No rank
+    # deficiency here (shape is never among these columns), so no
+    # trailing-column-drop is needed the way the old approach required.
+    subspace_basis_orthonormal, _ = torch.linalg.qr(subspace_basis_normalized)   # (64, n_active)
+    print(f"  Also QR-orthogonalized the same {len(subspace_names)} columns "
+          f"(spans the same subspace, genuinely orthonormal)")
 
     for label, (directions, variances, _, _) in pca_results.items():
         n_meaningful = min(args.num_interventions, len(directions))
         grad_dirs = F.normalize(directions[:n_meaningful], dim=1)   # (k, 64)
-        dots = grad_dirs @ W_normalized   # (k, cond_input_dim)
-
-        row_norms = torch.norm(dots, dim=1)   # (k,) — projection ratio (||d_proj||/||d||, d is unit)
-        col_norms = torch.norm(dots, dim=0)   # (cond_input_dim,)
-
-        print(f"\n  {label} — top {n_meaningful} gradient directions:")
-        header = "         " + "".join(f"{n:>10}" for n in feature_names) + "  proj_ratio"
-        print(header)
-        for i in range(n_meaningful):
-            row = f"  Dir {i+1:2d} " + "".join(f"{dots[i,j].item():>+10.3f}" for j in range(len(feature_names)))
-            row += f"  {row_norms[i].item():>10.3f}"
-            print(row)
-        col_row = "  col_norm" + "".join(f"{col_norms[j].item():>+10.3f}" for j in range(len(feature_names)))
-        print(col_row)
-
-        txt = header + "\n"
-        for i in range(n_meaningful):
-            txt += f"  Dir {i+1:2d} " + "".join(f"{dots[i,j].item():>+10.3f}" for j in range(len(feature_names)))
-            txt += f"  {row_norms[i].item():>10.3f}\n"
-        txt += col_row + "\n"
-        (out_dir / f"dot_products_{label}.txt").write_text(txt)
-        print(f"  Saved → {out_dir / f'dot_products_{label}.txt'}")
 
         # ------------------------------------------------------------------
-        # Second table: projection onto the CHOSEN subspace -- valid
+        # First table: projection onto the CHOSEN subspace -- valid
         # conditioning-vector directions (see build_valid_subspace_basis),
-        # not an orthogonalization of the raw weight columns above.
+        # baseline-subtracted (see the no-subtraction table further below).
         # ------------------------------------------------------------------
         dots_sub      = grad_dirs @ subspace_basis_normalized   # (k, n_continuous)
         proj_ratios   = torch.norm(dots_sub, dim=1)             # (k,) -- NOT guaranteed <=1,
@@ -493,11 +522,40 @@ def main():
         (out_dir / f"dot_products_subspace_{label}.txt").write_text(txt_sub)
         print(f"  Saved → {out_dir / f'dot_products_subspace_{label}.txt'}")
 
+        # ------------------------------------------------------------------
+        # Second table: projection onto the QR-ORTHOGONALIZED version of
+        # this same chosen subspace -- genuinely orthonormal (unlike the
+        # table above), still built from valid conditioning-vector
+        # directions.
+        # ------------------------------------------------------------------
+        dots_ortho      = grad_dirs @ subspace_basis_orthonormal   # (k, n_active)
+        proj_ratios_o   = torch.norm(dots_ortho, dim=1)            # (k,) -- guaranteed <= 1
+        col_norms_ortho = torch.norm(dots_ortho, dim=0)            # (n_active,)
+
+        print(f"\n  {label} — projected onto QR-orthogonalized chosen subspace "
+              f"({len(subspace_names)} dims: {subspace_names}):")
+        header_o = "         " + "".join(f"{f'Q{j+1}':>10}" for j in range(len(subspace_names))) + "  proj_ratio"
+        print(header_o)
+        for i in range(n_meaningful):
+            row = f"  Dir {i+1:2d} " + "".join(f"{dots_ortho[i,j].item():>+10.3f}" for j in range(len(subspace_names)))
+            row += f"  {proj_ratios_o[i].item():>10.3f}"
+            print(row)
+        col_row_o = "  col_norm" + "".join(f"{col_norms_ortho[j].item():>+10.3f}" for j in range(len(subspace_names)))
+        print(col_row_o)
+
+        txt_o = header_o + "\n"
+        for i in range(n_meaningful):
+            txt_o += f"  Dir {i+1:2d} " + "".join(f"{dots_ortho[i,j].item():>+10.3f}" for j in range(len(subspace_names)))
+            txt_o += f"  {proj_ratios_o[i].item():>10.3f}\n"
+        txt_o += col_row_o + "\n"
+        (out_dir / f"dot_products_subspace_orthonormal_{label}.txt").write_text(txt_o)
+        print(f"  Saved → {out_dir / f'dot_products_subspace_orthonormal_{label}.txt'}")
+
     # ------------------------------------------------------------------
-    # Pairwise cross-space dot product tables
+    # Pairwise cross-space dot product tables -- opt-in, off by default
     # ------------------------------------------------------------------
     labels = list(pca_results.keys())
-    if len(labels) > 1:
+    if args.cross_space_analysis and len(labels) > 1:
         threshold = 2.5 / 64   # significance threshold (same as ELROND paper)
         print(f"\n--- Pairwise dot products between gradient spaces (natural cutoff, threshold={threshold:.4f}) ---")
         for i, label_a in enumerate(labels):
@@ -581,25 +639,6 @@ def main():
         # dot product table vs ground truth
         n_meaningful = min(args.num_interventions, len(shared_dirs))
         shared_dirs_norm = F.normalize(shared_dirs[:n_meaningful], dim=1)
-        dots_s = shared_dirs_norm @ W_normalized
-        row_norms_s = torch.norm(dots_s, dim=1)
-        col_norms_s = torch.norm(dots_s, dim=0)
-
-        print(f"\n  shared — top {n_meaningful} directions vs conditioner features:")
-        header_s = "         " + "".join(f"{n:>10}" for n in feature_names) + "  proj_ratio"
-        print(header_s)
-        for i in range(n_meaningful):
-            row = f"  Dir {i+1:2d} " + "".join(f"{dots_s[i,j].item():>+10.3f}" for j in range(len(feature_names)))
-            row += f"  {row_norms_s[i].item():>10.3f}"
-            print(row)
-        col_row_s = "  col_norm" + "".join(f"{col_norms_s[j].item():>+10.3f}" for j in range(len(feature_names)))
-        print(col_row_s)
-        txt_s = header_s + "\n"
-        for i in range(n_meaningful):
-            txt_s += f"  Dir {i+1:2d} " + "".join(f"{dots_s[i,j].item():>+10.3f}" for j in range(len(feature_names)))
-            txt_s += f"  {row_norms_s[i].item():>10.3f}\n"
-        txt_s += col_row_s + "\n"
-        (out_dir / "dot_products_shared.txt").write_text(txt_s)
 
         # Chosen subspace table (same basis built once above, reused here)
         dots_ssub       = shared_dirs_norm @ subspace_basis_normalized
@@ -612,7 +651,21 @@ def main():
             txt_ssub += f"  {proj_ratios_ss[i].item():>10.3f}\n"
         txt_ssub += "  col_norm" + "".join(f"{col_norms_ssub[j].item():>+10.3f}" for j in range(len(subspace_names))) + "\n"
         (out_dir / "dot_products_subspace_shared.txt").write_text(txt_ssub)
-        print(f"  Saved dot product tables → {out_dir}/dot_products_shared.txt, dot_products_subspace_shared.txt")
+
+        # QR-orthogonalized version of the same shared-space table
+        dots_sortho       = shared_dirs_norm @ subspace_basis_orthonormal
+        proj_ratios_sortho = torch.norm(dots_sortho, dim=1)
+        col_norms_sortho   = torch.norm(dots_sortho, dim=0)
+        header_sortho = "         " + "".join(f"{f'Q{j+1}':>10}" for j in range(len(subspace_names))) + "  proj_ratio"
+        txt_sortho = header_sortho + "\n"
+        for i in range(n_meaningful):
+            txt_sortho += f"  Dir {i+1:2d} " + "".join(f"{dots_sortho[i,j].item():>+10.3f}" for j in range(len(subspace_names)))
+            txt_sortho += f"  {proj_ratios_sortho[i].item():>10.3f}\n"
+        txt_sortho += "  col_norm" + "".join(f"{col_norms_sortho[j].item():>+10.3f}" for j in range(len(subspace_names))) + "\n"
+        (out_dir / "dot_products_subspace_orthonormal_shared.txt").write_text(txt_sortho)
+
+        print(f"  Saved dot product tables → {out_dir}/dot_products_subspace_shared.txt, "
+              f"dot_products_subspace_orthonormal_shared.txt")
 
         # interventions for shared directions
         if not args.no_interventions:

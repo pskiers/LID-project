@@ -34,10 +34,12 @@ Direction extraction & interventions (new — mirrors pca_analysis.py):
   With a *linear* decoder, x_hat = W_dec @ z_tilde, so column j of W_dec
   is a single GLOBAL vector in gradient space — the direction latent dim
   j writes when active. That's the direct analog of a PCA eigenvector,
-  directly comparable (dot product) against the conditioner's ground
-  truth W columns, and directly usable for cond_out interventions. What
-  IS per-sample is sigma_z(x) (which of those fixed directions fire for
-  a given x) — the dictionary itself is fixed, unlike an MLP decoder's
+  directly comparable (dot product) against pca_analysis.py's "chosen
+  subspace" basis (valid conditioning-vector directions, not raw
+  conditioner.proj.weight columns), and directly usable for cond_out
+  interventions. What IS per-sample is sigma_z(x) (which of those fixed
+  directions fire for a given x) — the dictionary itself is fixed, unlike
+  an MLP decoder's
   Jacobian would be. See extract_decoder_directions() below.
 
   Because nothing in the VAEase objective forces decoder columns to be
@@ -833,65 +835,84 @@ def orthogonalize_directions(directions: torch.Tensor, rank_eps: float = 1e-6
 
 
 def build_alignment_tables(
-    directions: torch.Tensor, W_normalized: torch.Tensor, feature_names: list,
-    label: str, out_dir: Path, qr_drop_last: int = 1,
+    directions: torch.Tensor, subspace_basis_normalized: torch.Tensor,
+    subspace_basis_orthonormal: torch.Tensor, subspace_names: list,
+    label: str, out_dir: Path,
 ) -> None:
-    """Same two-table format as pca_analysis.py's dot-product section:
-    plain dot products against each conditioner input feature column,
-    plus a second table projected onto the QR-orthogonalized conditioner
-    subspace (dropping the last `qr_drop_last` columns for rank
-    deficiency, e.g. the one-hot sum-to-1 constraint — default 1, matching
-    rank(W)=9 for a 10-dim one-hot+continuous conditioner; set to 0 if
-    your W is already full rank).
+    """Same two-table format as pca_analysis.py's chosen-subspace
+    dot-product section: valid conditioning-vector directions (see
+    pca_analysis.py's build_valid_subspace_basis), NOT the raw
+    conditioner.proj.weight columns -- those include an invalid
+    shape=[0,0,0] reference point no real image was ever conditioned on,
+    and if the conditioner has any hidden layers before .proj, only
+    reflect that final linear layer's own weights rather than the
+    network's true end-to-end response.
+
+    Table 1: dot products against `subspace_basis_normalized` directly --
+    these columns are NOT mutually orthogonal in general (passing
+    standard-basis inputs through a nonlinear conditioner doesn't
+    preserve their orthogonality), so each column keeps a clean, single-
+    feature meaning, but summing across columns to ask "how much of this
+    direction is explained by the subspace overall" isn't reliable (see
+    table 2 for that).
+    Table 2: dot products against `subspace_basis_orthonormal` (QR'd
+    version of the same columns, spanning the identical subspace) --
+    genuinely orthonormal, so `proj_ratio` here is a trustworthy "how
+    much of this direction lies in the subspace at all" number (always
+    <= 1), at the cost of individual columns beyond the first no longer
+    corresponding to one specific named feature.
 
     `directions` should already be unit-normalized, (k, d), ranked in
     whatever order you want rows printed (e.g. by `importance` from
-    extract_decoder_directions, descending).
+    extract_decoder_directions, descending). Called once per VAEase
+    direction set (raw / orthogonalized) -- since VAEase decoder columns
+    aren't inherently orthogonal either, both sets are worth comparing
+    against both subspace-basis versions, same reasoning as pca_analysis.py.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     n_dirs = directions.shape[0]
-    dots = directions @ W_normalized   # (k, n_features)
 
-    row_norms = torch.norm(dots, dim=1)
+    # --- Table 1: non-orthogonalized chosen subspace ---
+    dots = directions @ subspace_basis_normalized   # (k, n_active)
+    row_norms = torch.norm(dots, dim=1)             # NOT guaranteed <= 1
     col_norms = torch.norm(dots, dim=0)
 
-    header = "         " + "".join(f"{n:>10}" for n in feature_names) + "  proj_ratio"
-    print(f"\n  {label} — {n_dirs} VAEase directions vs conditioner input features:")
+    header = "         " + "".join(f"{n:>10}" for n in subspace_names) + "  proj_ratio"
+    print(f"\n  {label} — {n_dirs} VAEase directions vs chosen subspace "
+          f"({len(subspace_names)} dims: {subspace_names}):")
     print(header)
     txt = header + "\n"
     for i in range(n_dirs):
-        row = f"  Dir {i+1:2d} " + "".join(f"{dots[i,j].item():>+10.3f}" for j in range(len(feature_names)))
+        row = f"  Dir {i+1:2d} " + "".join(f"{dots[i,j].item():>+10.3f}" for j in range(len(subspace_names)))
         row += f"  {row_norms[i].item():>10.3f}"
         print(row)
         txt += row + "\n"
-    col_row = "  col_norm" + "".join(f"{col_norms[j].item():>+10.3f}" for j in range(len(feature_names)))
+    col_row = "  col_norm" + "".join(f"{col_norms[j].item():>+10.3f}" for j in range(len(subspace_names)))
     print(col_row)
     txt += col_row + "\n"
-    (out_dir / f"dot_products_{label}.txt").write_text(txt)
-    print(f"  Saved → {out_dir / f'dot_products_{label}.txt'}")
+    (out_dir / f"dot_products_subspace_{label}.txt").write_text(txt)
+    print(f"  Saved → {out_dir / f'dot_products_subspace_{label}.txt'}")
 
-    n_features = W_normalized.shape[1]
-    n_qr = n_features - qr_drop_last
-    Q, _ = torch.linalg.qr(W_normalized)
-    Qk = Q[:, :n_qr]
-    dots_q = directions @ Qk
-    proj_ratios = torch.norm(dots_q, dim=1)
+    # --- Table 2: QR-orthogonalized chosen subspace ---
+    dots_q = directions @ subspace_basis_orthonormal   # (k, n_active)
+    proj_ratios = torch.norm(dots_q, dim=1)            # guaranteed <= 1
     col_norms_q = torch.norm(dots_q, dim=0)
 
-    header_q = "         " + "".join(f"{f'Q{j+1}':>10}" for j in range(n_qr)) + "  proj_ratio"
-    print(f"\n  {label} — projected onto orthogonalized conditioner space (QR, {n_qr} dims):")
+    header_q = "         " + "".join(f"{f'Q{j+1}':>10}" for j in range(len(subspace_names))) + "  proj_ratio"
+    print(f"\n  {label} — projected onto QR-orthogonalized chosen subspace "
+          f"({len(subspace_names)} dims: {subspace_names}):")
     print(header_q)
     txt_q = header_q + "\n"
     for i in range(n_dirs):
-        row = f"  Dir {i+1:2d} " + "".join(f"{dots_q[i,j].item():>+10.3f}" for j in range(n_qr))
+        row = f"  Dir {i+1:2d} " + "".join(f"{dots_q[i,j].item():>+10.3f}" for j in range(len(subspace_names)))
         row += f"  {proj_ratios[i].item():>10.3f}"
         print(row)
         txt_q += row + "\n"
-    col_row_q = "  col_norm" + "".join(f"{col_norms_q[j].item():>+10.3f}" for j in range(n_qr))
+    col_row_q = "  col_norm" + "".join(f"{col_norms_q[j].item():>+10.3f}" for j in range(len(subspace_names)))
     print(col_row_q)
     txt_q += col_row_q + "\n"
-    (out_dir / f"dot_products_qr_{label}.txt").write_text(txt_q)
-    print(f"  Saved → {out_dir / f'dot_products_qr_{label}.txt'}")
+    (out_dir / f"dot_products_subspace_orthonormal_{label}.txt").write_text(txt_q)
+    print(f"  Saved → {out_dir / f'dot_products_subspace_orthonormal_{label}.txt'}")
 
 
 def group_active_set_overlap_table(
@@ -1455,8 +1476,9 @@ if __name__ == "__main__":
     parser.add_argument("--run_interventions", action="store_true",
                         help="After training/loading, extract decoder directions "
                              "(raw + QR-orthogonalized), build alignment tables "
-                             "against the conditioner's W, optionally build a group "
-                             "active-set overlap table, and generate intervention "
+                             "against the chosen conditioning subspace (see "
+                             "--cross_space_analysis for the optional group "
+                             "active-set overlap table), and generate intervention "
                              "grids for both direction sets.")
     parser.add_argument("--num_interventions", type=int, default=10,
                         help="How many top (by importance) active directions to "
@@ -1465,35 +1487,56 @@ if __name__ == "__main__":
                         default=[0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0, -0.1, -0.2, -0.3, -0.4, -0.5, -0.6])
     parser.add_argument("--num_steps", type=int, default=10,
                         help="DDIM sampling steps for intervention images.")
-    parser.add_argument("--base_prompt", type=float, nargs=10,
-                        default=[0.0, 0.0, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
-                        metavar=("is_tri", "is_sq", "is_circ", "r", "g", "b", "size",
-                                 "h_stripe", "v_stripe", "grain"),
-                        help="Base conditioning vector for intervention images, same "
-                             "convention as pca_analysis.py: 0.5 dims are randomised "
-                             "per seed, other values stay fixed.")
+    parser.add_argument("--base_prompt", type=float, nargs="+",
+                        default=[0.0, 0.0, 1.0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+                        metavar="V",
+                        help="Base conditioning vector for intervention images, length "
+                             "must equal --cond_input_dim. Same convention as "
+                             "pca_analysis.py: 0.5 dims are randomised per seed, other "
+                             "values stay fixed (and, for the chosen-subspace basis "
+                             "below, any continuous dim NOT set to 0.5 is treated as "
+                             "fixed rather than swept as a basis direction). Default "
+                             "(9 values) matches the default --cond_input_dim=9 "
+                             "ordering: [is_tri, is_sq, is_circ, r, g, b, size, pos_x, "
+                             "pos_y].")
     parser.add_argument("--imgs_per_base", type=int, default=6,
                         help="Number of randomised base conditioning vectors "
                              "(rows in each intervention grid).")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Diffusion model checkpoint directory (unet_ema/, "
-                             "conditioner.pt) — required if --run_interventions is set.")
-    parser.add_argument("--cond_input_dim", type=int, default=10,
+                             "conditioner.pt) — required if --run_interventions is set. "
+                             "This is the SAME checkpoint used for both interventions "
+                             "AND the alignment tables below: the conditioner it "
+                             "contains is what build_valid_subspace_basis runs forward "
+                             "passes through to build the chosen-subspace basis, so "
+                             "there's nothing extra to pass for that part specifically.")
+    parser.add_argument("--cond_input_dim", type=int, default=9,
                         help="Conditioner input dim, passed to Config64 — matches "
-                             "pca_analysis.py's hardcoded cond_input_dim=10; set to 7 "
-                             "for the no-texture dataset variant.")
+                             "pca_analysis.py's default cond_input_dim=9 (shape+color"
+                             "+size+position, no grain); set to 7 for the shape+color"
+                             "+size-only variant. Must match --base_prompt's length.")
     parser.add_argument("--group_labels", type=str, default=None,
                         help="Optional .npy file of (N,) integer/string group labels, "
                              "same length/order as --grads after concatenation, for the "
                              "group active-set overlap table (e.g. per-timestep ids if "
                              "you concatenated grads_t50.npy + grads_t950.npy in that "
-                             "order — pass labels accordingly).")
-    parser.add_argument("--qr_drop_last", type=int, default=1,
-                        help="How many trailing QR columns of the conditioner's W to "
-                             "drop for rank deficiency in the alignment table (default "
-                             "1, matching rank(W)=9 for a 10-dim one-hot+continuous "
-                             "conditioner; set 0 if your W is already full rank).")
+                             "order — pass labels accordingly). Only used if "
+                             "--cross_space_analysis is also set.")
+    parser.add_argument("--cross_space_analysis", action="store_true", default=False,
+                        help="Also build the group active-set overlap table (Jaccard "
+                             "overlap of which global decoder directions fire for "
+                             "different --group_labels groups) -- the VAEase counterpart "
+                             "to pca_analysis.py's cross-timestep comparison. Off by "
+                             "default, same as pca_analysis.py's --cross_space_analysis. "
+                             "Requires --group_labels to also be given.")
     args = parser.parse_args()
+
+    if len(args.base_prompt) != args.cond_input_dim:
+        raise SystemExit(
+            f"--base_prompt has {len(args.base_prompt)} values but --cond_input_dim="
+            f"{args.cond_input_dim}. Pass exactly {args.cond_input_dim} values, e.g. for "
+            f"the default 9-dim case: --base_prompt 0 0 1  0.5 0.5 0.5  0.5  0.5 0.5"
+        )
 
     if args.self_test:
         self_test()
@@ -1581,6 +1624,11 @@ if __name__ == "__main__":
     from diffusers import DDIMScheduler, DDPMScheduler, UNet2DConditionModel
     from configs.config_64 import Config64 as Config
     from models.conditioner import ShapeConditioningEncoder
+    # Imported directly rather than reimplemented, so this can never
+    # silently drift out of sync with pca_analysis.py's own basis --
+    # same reasoning sanity_check_gradients.py already uses for
+    # collect_gradients.py's noise_image/predict_x0.
+    from directions import build_valid_subspace_basis, resolve_feature_names, N_SHAPE_DIMS
 
     cfg = Config(cond_input_dim=args.cond_input_dim)
     ckpt = Path(args.checkpoint)
@@ -1605,26 +1653,48 @@ if __name__ == "__main__":
     ddim = DDIMScheduler.from_config(ddpm.config)
     ddim.set_timesteps(args.num_steps)
 
-    W = conditioner.proj.weight.detach().cpu()   # (d, cond_input_dim)
-    W_normalized = F.normalize(W, dim=0)
-    feature_names = ["is_tri", "is_sq", "is_circ", "r", "g", "b", "size",
-                      "h_stripe", "v_stripe", "grain"][:args.cond_input_dim]
+    # The "chosen subspace" basis -- valid conditioning-vector differences
+    # for whichever shape/fixed-dims --base_prompt specifies, restricted
+    # to only the continuous dims --base_prompt marks active (0.5). Same
+    # `conditioner` object loaded from --checkpoint just above is what
+    # gets run forward through here -- no separate checkpoint argument
+    # needed for this part.
+    feature_names = resolve_feature_names(args.cond_input_dim)
+    subspace_basis_raw, subspace_names = build_valid_subspace_basis(
+        conditioner, args.base_prompt, feature_names, args.cond_input_dim, device,
+        subtract_baseline=True,
+    )
+    subspace_basis = torch.from_numpy(subspace_basis_raw.astype(np.float32))
+    subspace_basis_normalized = F.normalize(subspace_basis, dim=0)
+    subspace_basis_orthonormal, _ = torch.linalg.qr(subspace_basis_normalized)
+    print(f"Chosen subspace basis built for shape one-hot {args.base_prompt[:N_SHAPE_DIMS]} "
+          f"({len(subspace_names)} active continuous dims: {subspace_names})")
 
     # ------------------------------------------------------------------
-    # Alignment tables — raw and orthogonalized, same format as pca_analysis.py
+    # Alignment tables — raw and orthogonalized VAEase directions, each
+    # against both the non-orthogonalized and QR-orthogonalized chosen
+    # subspace (4 tables total) -- since VAEase decoder columns aren't
+    # inherently orthogonal either, both direction sets are worth
+    # comparing against both basis versions.
     # ------------------------------------------------------------------
-    print("\n=== Alignment tables: VAEase directions vs conditioner ===")
-    build_alignment_tables(F.normalize(raw_directions, dim=1), W_normalized,
-                            feature_names, "vaease_raw", out_dir, qr_drop_last=args.qr_drop_last)
-    build_alignment_tables(ortho_directions, W_normalized,
-                            feature_names, "vaease_orthogonalized", out_dir, qr_drop_last=args.qr_drop_last)
+    print("\n=== Alignment tables: VAEase directions vs chosen subspace ===")
+    build_alignment_tables(F.normalize(raw_directions, dim=1),
+                            subspace_basis_normalized, subspace_basis_orthonormal,
+                            subspace_names, "vaease_raw", out_dir)
+    build_alignment_tables(ortho_directions,
+                            subspace_basis_normalized, subspace_basis_orthonormal,
+                            subspace_names, "vaease_orthogonalized", out_dir)
 
     # ------------------------------------------------------------------
-    # Group active-set overlap table (new — no PCA analog)
+    # Group active-set overlap table (new — no PCA analog) -- opt-in,
+    # off by default, matching pca_analysis.py's --cross_space_analysis
     # ------------------------------------------------------------------
-    if group_labels is not None:
+    if args.cross_space_analysis and group_labels is not None:
         print("\n=== Group active-set overlap ===")
         group_active_set_overlap_table(sigma_z_all, group_labels, out_dir)
+    elif args.cross_space_analysis and group_labels is None:
+        print("\n(--cross_space_analysis set but no --group_labels given -- skipping "
+              "group active-set overlap table, nothing to group by)")
 
     # ------------------------------------------------------------------
     # Interventions — base conditioning vectors, then both direction sets

@@ -329,7 +329,10 @@ def plot_case_at_timestep(
       1. -gradient's alignment (`grad_align` here is ALREADY the negated
          gradient -- see main(), where it's computed directly as
          alignment_scores(-grad_a, W) rather than negated for display)
-      2. the TRUE expected direction (conditioner(B) - conditioner(A))
+      2. the TRUE reference: raw conditioning-vector difference
+         (vec_b[feature] - vec_a[feature]), the same quantity the
+         correlation analysis below calls "true_diffs" -- NOT a
+         conditioner-embedding-space projection
     The feature(s) this pair was designed to vary are colored orange;
     everything else is blue, so the "intended" bar is easy to spot
     without losing the full comparison.
@@ -369,8 +372,8 @@ def plot_case_at_timestep(
     ax2.bar(feature_names, expected_align, color=colors)
     ax2.axhline(0, color="black", linewidth=0.5)
     ax2.set_ylim(-1, 1)
-    ax2.set_ylabel("cosine alignment")
-    ax2.set_title("true direction: conditioner(B) - conditioner(A)  [reference]", fontsize=9)
+    ax2.set_ylabel("raw conditioning diff")
+    ax2.set_title("true direction: raw conditioning diff (vec_b - vec_a)  [reference]", fontsize=9)
     ax2.tick_params(axis="x", rotation=45)
 
     for i in range(2, n_rows):
@@ -446,9 +449,11 @@ def plot_sweep_average_bar(
 ) -> None:
     """Images on the left; on the right, ALL features, each with TWO
     grouped bars: -gradient (mean +/- std across the sweep -- `sweep_mean`
-    already holds -gradient values, see main()) and the true expected
-    direction -- so you can directly compare the intended feature's bars
-    against every other feature's, not just see it in isolation. The
+    already holds -gradient values, see main()) and the true reference --
+    the raw conditioning-vector difference (vec_b[feature] -
+    vec_a[feature]), the same quantity the correlation analysis calls
+    "true_diffs" -- so you can directly compare the intended feature's
+    bars against every other feature's, not just see it in isolation. The
     feature(s) this pair varies get a light orange background band
     behind their whole group, so the "intended" one is still easy to
     spot in a wider chart.
@@ -480,13 +485,13 @@ def plot_sweep_average_bar(
         if highlight_features and name in highlight_features:
             ax.axvspan(i - 0.5, i + 0.5, color="tab:orange", alpha=0.15, zorder=0)
     ax.bar(x - 0.18, means, width=0.36, yerr=stds, color="tab:purple", capsize=4, label="-gradient (mean +/- std)")
-    ax.bar(x + 0.18, refs, width=0.36, color="tab:gray", label="true direction (reference)")
+    ax.bar(x + 0.18, refs, width=0.36, color="tab:gray", label="true diff in conditioning (reference)")
     ax.axhline(0, color="black", linewidth=0.5)
     ax.set_xticks(x)
     ax.set_xticklabels(feature_names, rotation=45)
     ax.set_xlim(-0.5, len(feature_names) - 0.5)
     ax.set_ylim(-1, 1)
-    ax.set_ylabel("cosine alignment")
+    ax.set_ylabel("value  (-gradient: cosine alignment;  reference: raw diff)")
     ax.set_title(title, fontsize=11)
     ax.legend(fontsize=8)
     fig.tight_layout()
@@ -501,9 +506,9 @@ def plot_sweep_average_bar(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, default="/net/scratch/hscra/plgrid/plgekaczmarczyk/LID-project/synthetic_dataset/outputs/checkpoints/outputs_64_acc_mixed_dz0.1_pos1/checkpoint-epoch-0200")
-    parser.add_argument("--out_dir", type=str, default="outputs/sanity_checks/det_circles_corr_pos1/")
-    parser.add_argument("--cond_input_dim", type=int, default=9)
+    parser.add_argument("--checkpoint", type=str, default="/net/scratch/hscra/plgrid/plgekaczmarczyk/LID-project/synthetic_dataset/outputs/checkpoints/outputs_64_acc_mixed_dz0.1_pos/checkpoint-epoch-0200")
+    parser.add_argument("--out_dir", type=str, default="outputs/sanity_checks/det_circles_corr_pos/")
+    parser.add_argument("--cond_input_dim", type=int, default=10)
     parser.add_argument("--timesteps", type=int, nargs="+", default=[900, 500, 100],
                         help="Timesteps to check, matching collect_gradients.py's own "
                              "--timesteps convention. A representative spread (high/mid/low) "
@@ -646,18 +651,19 @@ def main():
         ]
         print(f"\n=== {case['label']}: circle A {vec_a_random_list} vs circle B {vec_b_random_list} ===")
 
-        vec_a_random = torch.tensor(vec_a_random_list, dtype=torch.float32)
-        vec_b_random = torch.tensor(vec_b_random_list, dtype=torch.float32)
-        with torch.no_grad():
-            # The TRUE reference direction: both circles' own actual
-            # conditioning, nothing to do with the neutral prompt. This
-            # answers "what's the genuine difference between circle A
-            # and circle B" -- a well-posed question independent of
-            # wherever the gradient itself happens to be anchored.
-            expected_direction = (
-                conditioner(vec_b_random.unsqueeze(0).to(device)) - conditioner(vec_a_random.unsqueeze(0).to(device))
-            ).squeeze().cpu().numpy()
-        expected_align = alignment_scores(expected_direction, W)
+        # The TRUE reference: the simple, raw difference between circle B's
+        # and circle A's own actual conditioning-vector VALUES, feature by
+        # feature (vec_b[feature] - vec_a[feature]) -- the exact same
+        # quantity used as "true_diffs" in the correlation analysis below,
+        # NOT a conditioner-embedding-space projection (that's what this
+        # used to be: conditioner(B) - conditioner(A), then projected onto
+        # W). This answers "how much did this feature's raw value actually
+        # change between the two circles" directly, with no conditioner
+        # network involved at all, and no dependence on the basis W --
+        # matching what the correlation section actually correlates
+        # against, not a differently-derived quantity that happens to look
+        # similar.
+        expected_align = np.array(vec_b_random_list[N_SHAPE_DIMS:]) - np.array(vec_a_random_list[N_SHAPE_DIMS:])
 
         curves = {name: [] for name in feature_names}
         for t in args.timesteps:
