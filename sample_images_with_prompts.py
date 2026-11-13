@@ -77,6 +77,12 @@ def main(
         cache_dir="./model_cache",
         device_map="balanced",
     )
+    
+    pipe.scheduler.set_timesteps(num_inference_steps)
+    print("scheduler:", type(pipe.scheduler).__name__,
+          "| spacing:", pipe.scheduler.config.timestep_spacing,
+          "| offset:", pipe.scheduler.config.steps_offset)
+    print("timesteps:", pipe.scheduler.timesteps)
 
     if lora_path is not None:
         print(f"Loading LoRA weights from {lora_path}")
